@@ -8,6 +8,7 @@ import {
   LogIn, 
   AlertCircle 
 } from 'lucide-react';
+import { getApiUrl } from '../services/dbService';
 
 interface AuthScreenProps {
   onAuthSuccess: (user: any) => void;
@@ -19,6 +20,9 @@ export default function AuthScreen({ onAuthSuccess }: AuthScreenProps) {
   const [isSignUp, setIsSignUp] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [apiUrlInput, setApiUrlInput] = useState(() => {
+    return localStorage.getItem("LENS_LOGIC_API_URL") || (typeof process !== "undefined" && process.env?.APP_URL) || "";
+  });
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -28,11 +32,21 @@ export default function AuthScreen({ onAuthSuccess }: AuthScreenProps) {
     const endpoint = isSignUp ? '/api/auth/register' : '/api/auth/login';
 
     try {
-      const response = await fetch(endpoint, {
+      const response = await fetch(getApiUrl(endpoint), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password })
       });
+
+      // Verify if the response is JSON, because Vercel/proxies might return HTML on 404/500
+      const contentType = response.headers.get("content-type") || "";
+      if (!contentType.includes("application/json")) {
+        const textError = await response.text();
+        console.error("API response is not JSON:", textError);
+        throw new Error(
+          "Backend API returned HTML instead of JSON. This usually means the API URL is incorrect, the route was not found (404), or the backend server is offline."
+        );
+      }
 
       const data = await response.json();
 
@@ -189,6 +203,42 @@ export default function AuthScreen({ onAuthSuccess }: AuthScreenProps) {
           <p className="text-xs text-slate-400">
             💡 <strong className="text-indigo-300">Admin Account:</strong> Access directly using <span className="font-mono text-indigo-200">msany6117@gmail.com</span> and password <span className="font-mono text-indigo-200">Admin@124390</span>.
           </p>
+        </div>
+
+        {/* Backend Connection Settings */}
+        <div className="mt-4 p-4 rounded-xl bg-white/[0.02] border border-white/5 text-center">
+          <details className="group">
+            <summary className="text-xs font-semibold text-slate-400 hover:text-slate-300 cursor-pointer list-none flex items-center justify-center gap-1.5 select-none">
+              <span>🔧 Connection Settings (Vercel / Custom Domain)</span>
+              <span className="transition-transform group-open:rotate-180 text-[10px]">▼</span>
+            </summary>
+            <div className="mt-3 text-left space-y-2.5 pt-2 border-t border-white/5">
+              <p className="text-[11px] text-slate-400 leading-relaxed">
+                If hosted on Vercel or a custom domain, specify your Cloud Run Express backend server URL:
+              </p>
+              <div>
+                <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1.5">Backend API Base URL</label>
+                <input
+                  type="text"
+                  placeholder="https://your-backend-cloud-run-url.run.app"
+                  value={apiUrlInput}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setApiUrlInput(val);
+                    if (val.trim()) {
+                      localStorage.setItem("LENS_LOGIC_API_URL", val.trim());
+                    } else {
+                      localStorage.removeItem("LENS_LOGIC_API_URL");
+                    }
+                  }}
+                  className="w-full px-3 py-1.5 bg-white/5 border border-white/10 rounded-lg text-xs focus:outline-none focus:border-indigo-500/50 text-white font-mono"
+                />
+              </div>
+              <p className="text-[9px] text-slate-500 italic font-mono">
+                Currently targeting: {localStorage.getItem("LENS_LOGIC_API_URL") || (typeof process !== "undefined" && process.env?.APP_URL) || "Relative Paths (Default)"}
+              </p>
+            </div>
+          </details>
         </div>
       </div>
     </div>

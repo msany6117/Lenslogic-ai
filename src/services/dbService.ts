@@ -1,6 +1,25 @@
 import type { ImageMetadata } from "../types";
 import { compressImage } from "../lib/utils";
 
+// Helper to determine the backend API base URL
+export function getApiUrl(path: string): string {
+  const envUrl = (import.meta as any).env?.VITE_API_URL;
+  // process.env.APP_URL is injected via Vite's define config
+  const appUrl = (typeof process !== "undefined" && process.env?.APP_URL) || "";
+  const localUrl = localStorage.getItem("LENS_LOGIC_API_URL");
+  
+  // Choose the best available base URL
+  const base = (envUrl || localUrl || appUrl || "").replace(/\/$/, "");
+  
+  // If we don't have any base configured, use relative path as is.
+  // When on localhost, do NOT prefix relative path because the backend dev server is on the same port/origin
+  if (!base || window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1") {
+    return path;
+  }
+  
+  return `${base}${path}`;
+}
+
 // Save or update user profile settings
 export async function saveUserProfile(uid: string, email: string, data?: Partial<{
   savedApiKey: string;
@@ -8,7 +27,7 @@ export async function saveUserProfile(uid: string, email: string, data?: Partial
   savedSettings: any;
 }>) {
   try {
-    const res = await fetch("/api/users/update", {
+    const res = await fetch(getApiUrl("/api/users/update"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -85,7 +104,7 @@ export async function saveAsset(asset: ImageMetadata, userId: string) {
       createdAt: asset.createdAt || new Date().toISOString()
     };
 
-    const res = await fetch("/api/assets", {
+    const res = await fetch(getApiUrl("/api/assets"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(assetData)
@@ -102,7 +121,7 @@ export async function saveAsset(asset: ImageMetadata, userId: string) {
 // Load all assets for a user
 export async function loadUserAssets(userId: string): Promise<ImageMetadata[]> {
   try {
-    const res = await fetch(`/api/assets?userId=${encodeURIComponent(userId)}`);
+    const res = await fetch(getApiUrl(`/api/assets?userId=${encodeURIComponent(userId)}`));
     if (!res.ok) {
       throw new Error("Failed to load assets.");
     }
@@ -130,7 +149,7 @@ export async function loadUserAssets(userId: string): Promise<ImageMetadata[]> {
 // Delete an asset from database
 export async function deleteAssetFromDb(assetId: string) {
   try {
-    const res = await fetch(`/api/assets/${encodeURIComponent(assetId)}`, {
+    const res = await fetch(getApiUrl(`/api/assets/${encodeURIComponent(assetId)}`), {
       method: "DELETE"
     });
     if (!res.ok) {
@@ -144,7 +163,7 @@ export async function deleteAssetFromDb(assetId: string) {
 // Clear all assets for a user from database
 export async function clearAllAssetsFromDb(userId: string) {
   try {
-    const res = await fetch("/api/assets/clear", {
+    const res = await fetch(getApiUrl("/api/assets/clear"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ userId })
@@ -160,7 +179,7 @@ export async function clearAllAssetsFromDb(userId: string) {
 // Admin function: Load all users
 export async function adminLoadAllUsers() {
   try {
-    const res = await fetch("/api/admin/users");
+    const res = await fetch(getApiUrl("/api/admin/users"));
     if (!res.ok) {
       throw new Error("Failed to load admin users.");
     }
@@ -174,7 +193,7 @@ export async function adminLoadAllUsers() {
 // Admin function: Load all assets for metrics
 export async function adminLoadAllAssets() {
   try {
-    const res = await fetch("/api/admin/assets");
+    const res = await fetch(getApiUrl("/api/admin/assets"));
     if (!res.ok) {
       throw new Error("Failed to load admin assets.");
     }
