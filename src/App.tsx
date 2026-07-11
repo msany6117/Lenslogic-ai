@@ -17,7 +17,8 @@ import {
   Video as VideoIcon,
   Key,
   Shield,
-  LogOut
+  LogOut,
+  RotateCcw
 } from 'lucide-react';
 import { useDropzone, type Accept } from 'react-dropzone';
 import Papa from 'papaparse';
@@ -75,7 +76,21 @@ export default function App() {
   // Check auth state on mount and sync assets
   React.useEffect(() => {
     const initAuth = async () => {
-      const savedUser = localStorage.getItem('lenslogic_user');
+      let savedUser = localStorage.getItem('lenslogic_user');
+      if (!savedUser) {
+        // Auto-initialize premium persistent guest session to bypass account setup
+        const guestUid = 'guest_' + Math.random().toString(36).substring(2, 11);
+        const guestUser = {
+          uid: guestUid,
+          email: 'guest@lenslogic.ai',
+          role: 'user',
+          savedSettings: null,
+          createdAt: new Date().toISOString()
+        };
+        localStorage.setItem('lenslogic_user', JSON.stringify(guestUser));
+        savedUser = JSON.stringify(guestUser);
+      }
+
       if (savedUser) {
         try {
           const currentUser = JSON.parse(savedUser);
@@ -117,11 +132,22 @@ export default function App() {
   }, [settings, user]);
 
   const handleSignOut = async () => {
-    localStorage.removeItem('lenslogic_user');
-    setUser(null);
-    setUserProfile(null);
-    setImages([]);
-    setActiveTab('upload');
+    if (window.confirm("Are you sure you want to reset your session? All current assets in your workspace will be cleared.")) {
+      localStorage.removeItem('lenslogic_user');
+      setImages([]);
+      setActiveTab('upload');
+      const guestUid = 'guest_' + Math.random().toString(36).substring(2, 11);
+      const guestUser = {
+        uid: guestUid,
+        email: 'guest@lenslogic.ai',
+        role: 'user',
+        savedSettings: null,
+        createdAt: new Date().toISOString()
+      };
+      localStorage.setItem('lenslogic_user', JSON.stringify(guestUser));
+      setUser(guestUser);
+      setUserProfile(guestUser);
+    }
   };
 
   // File Upload Handling
@@ -626,21 +652,21 @@ export default function App() {
           <div className="flex items-center justify-between gap-3 px-1">
             <div className="flex items-center gap-3 min-w-0">
               <div className="w-9 h-9 rounded-full bg-slate-800 border border-white/10 overflow-hidden flex items-center justify-center shrink-0">
-                 <img src={`https://api.dicebear.com/7.x/avataaars/svg?seed=${user?.email || 'Felix'}`} alt="avatar" className="w-full h-full" />
+                 <img src={`https://api.dicebear.com/7.x/avataaars/svg?seed=${user?.uid || 'Felix'}`} alt="avatar" className="w-full h-full" />
               </div>
               <div className="flex-1 min-w-0">
-                <p className="text-xs font-bold text-white truncate">{user?.email?.split('@')[0] || 'Contributor'}</p>
-                <p className="text-[10px] text-emerald-400 font-bold uppercase truncate">
-                  {userProfile?.role === 'admin' ? 'Admin Access' : 'Pro Plan Active'}
+                <p className="text-xs font-bold text-white truncate">Guest Workspace</p>
+                <p className="text-[10px] text-indigo-400 font-bold uppercase truncate">
+                  Studio Active
                 </p>
               </div>
             </div>
             <button 
               onClick={handleSignOut}
               className="p-2 hover:bg-white/5 hover:text-rose-400 text-slate-500 rounded-lg transition-colors cursor-pointer"
-              title="Sign Out"
+              title="Reset Workspace Session"
             >
-              <LogOut className="w-4 h-4" />
+              <RotateCcw className="w-4 h-4" />
             </button>
           </div>
         </div>
