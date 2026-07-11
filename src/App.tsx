@@ -401,9 +401,21 @@ export default function App() {
       return isIdleOrError && (!needsPreview || hasPreview);
     });
     
-    for (const img of pending) {
-      await generateMetadata(img);
-    }
+    const CONCURRENCY = 4;
+    const queue = [...pending];
+    
+    const worker = async () => {
+      while (queue.length > 0) {
+        const img = queue.shift();
+        if (!img) break;
+        await generateMetadata(img);
+      }
+    };
+
+    // Run up to CONCURRENCY workers concurrently
+    const workers = Array.from({ length: Math.min(CONCURRENCY, queue.length) }, worker);
+    await Promise.all(workers);
+
     setIsProcessingAll(false);
   };
 
@@ -1052,7 +1064,7 @@ function FeatureCard({ icon, title, description }: { icon: ReactNode, title: str
   );
 }
 
-function MetadataRow({ 
+const MetadataRow = React.memo(function MetadataRow({ 
   image, 
   onGenerate, 
   onRemove, 
@@ -1062,6 +1074,19 @@ function MetadataRow({
 }: any) {
   const [copied, setCopied] = useState(false);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+
+  // Maintain local state for snappy, zero-lag typing
+  const [localTitle, setLocalTitle] = useState(image.title || "");
+  const [localDescription, setLocalDescription] = useState(image.description || "");
+
+  // Keep local state synchronized with incoming prop updates (e.g., when AI generation completes)
+  React.useEffect(() => {
+    setLocalTitle(image.title || "");
+  }, [image.title]);
+
+  React.useEffect(() => {
+    setLocalDescription(image.description || "");
+  }, [image.description]);
 
   const handleCopy = () => {
     onCopyKeywords();
@@ -1073,6 +1098,18 @@ function MetadataRow({
     const file = e.target.files?.[0];
     if (file) {
       onSetPreview(file);
+    }
+  };
+
+  const handleTitleBlur = () => {
+    if (localTitle !== image.title) {
+      onUpdate('title', localTitle);
+    }
+  };
+
+  const handleDescriptionBlur = () => {
+    if (localDescription !== image.description) {
+      onUpdate('description', localDescription);
     }
   };
 
@@ -1191,8 +1228,9 @@ function MetadataRow({
                   <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1.5 block text-left">Title (Optimized)</label>
                   <input 
                     type="text" 
-                    value={image.title}
-                    onChange={(e) => onUpdate('title', e.target.value)}
+                    value={localTitle}
+                    onChange={(e) => setLocalTitle(e.target.value)}
+                    onBlur={handleTitleBlur}
                     disabled={image.status === 'processing'}
                     placeholder="Generating title..."
                     className="w-full text-sm font-medium text-white bg-transparent border-b border-white/5 hover:border-white/10 focus:border-indigo-500/50 focus:outline-none transition-all pb-1 placeholder:text-slate-600"
@@ -1201,8 +1239,9 @@ function MetadataRow({
                 <div>
                   <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1.5 block text-left">Description</label>
                   <textarea 
-                     value={image.description}
-                     onChange={(e) => onUpdate('description', e.target.value)}
+                     value={localDescription}
+                     onChange={(e) => setLocalDescription(e.target.value)}
+                     onBlur={handleDescriptionBlur}
                      disabled={image.status === 'processing'}
                      rows={1}
                      placeholder="Analyzing visual details..."
@@ -1249,4 +1288,15 @@ function MetadataRow({
       )}
     </motion.div>
   );
-}
+}, (prevProps, nextProps) => {
+  return (
+    prevProps.image.id === nextProps.image.id &&
+    prevProps.image.status === nextProps.image.status &&
+    prevProps.image.title === nextProps.image.title &&
+    prevProps.image.description === nextProps.image.description &&
+    prevProps.image.preview === nextProps.image.preview &&
+    prevProps.image.error === nextProps.image.error &&
+    prevProps.image.keywords?.length === nextProps.image.keywords?.length &&
+    JSON.stringify(prevProps.image.keywords) === JSON.stringify(nextProps.image.keywords)
+  );
+});

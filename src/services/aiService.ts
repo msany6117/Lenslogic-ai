@@ -8,11 +8,42 @@ export async function generateMetadata(
   assetType: AssetType = 'Photo'
 ): Promise<{ title: string; description: string; keywords: string[] }> {
   
-  const apiKey = activeKey?.key;
-  const provider = activeKey?.provider || 'Gemini';
+  // Build a prioritized list of keys to try
+  const keysToTry: ApiKeyEntry[] = [];
+  const allKeys = settings.apiKeys || [];
+  const active = activeKey && activeKey.key ? activeKey : null;
   
-  if (!apiKey) {
-    throw new Error("No active API Key found. Please add or select a Gemini or Groq key in Settings.");
+  const geminiKeys = allKeys.filter(k => k.provider === 'Gemini' && k.key);
+  const groqKeys = allKeys.filter(k => k.provider === 'Groq' && k.key);
+  
+  // Try active key first if it is Gemini
+  if (active && active.provider === 'Gemini') {
+    keysToTry.push(active);
+    keysToTry.push(...geminiKeys.filter(k => k.id !== active.id));
+  } else {
+    keysToTry.push(...geminiKeys);
+  }
+  
+  // Try active key next if it is Groq
+  if (active && active.provider === 'Groq') {
+    keysToTry.push(active);
+    keysToTry.push(...groqKeys.filter(k => k.id !== active.id));
+  } else {
+    keysToTry.push(...groqKeys);
+  }
+  
+  // De-duplicate
+  const uniqueKeys: ApiKeyEntry[] = [];
+  const seenIds = new Set<string>();
+  for (const k of keysToTry) {
+    if (!seenIds.has(k.id)) {
+      seenIds.add(k.id);
+      uniqueKeys.push(k);
+    }
+  }
+
+  if (uniqueKeys.length === 0) {
+    throw new Error("No valid API keys found. Please add at least one Gemini or Groq API key in Settings.");
   }
 
   const prompt = `
@@ -46,11 +77,25 @@ export async function generateMetadata(
     - "keywords": A flat array of ${settings.keywordCount} strings.
   `;
 
-  if (provider === 'Gemini') {
-    return callGemini(base64Image, prompt, apiKey, settings);
-  } else {
-    return callGroq(base64Image, prompt, apiKey, settings);
+  let lastError: any = null;
+  
+  for (const keyEntry of uniqueKeys) {
+    try {
+      console.log(`Attempting generation with ${keyEntry.provider} key "${keyEntry.label}"...`);
+      if (keyEntry.provider === 'Gemini') {
+        return await callGemini(base64Image, prompt, keyEntry.key, settings);
+      } else {
+        return await callGroq(base64Image, prompt, keyEntry.key, settings);
+      }
+    } catch (err: any) {
+      console.warn(`${keyEntry.provider} key "${keyEntry.label}" failed:`, err);
+      lastError = err;
+    }
   }
+
+  // If all keys in uniqueKeys failed, throw a readable combined error
+  const finalErrorMsg = lastError?.message || lastError || "Unknown error";
+  throw new Error(`All ${uniqueKeys.length} configured API keys failed. Last provider error: ${finalErrorMsg}`);
 }
 
 async function callGemini(base64Image: string, prompt: string, apiKey: string, settings: GenerationSettings) {
@@ -72,58 +117,87 @@ async function callGemini(base64Image: string, prompt: string, apiKey: string, s
     }
   }
 
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: {
-        parts: [
-          { text: prompt },
-          {
-            inlineData: {
-              data: data,
-              mimeType: finalMimeType,
-            },
+  // Highly robust list of model candidates to fail over
+  const candidateModels = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-3.5-flash"];
+  let lastError: any = null;
+
+  for (const modelName of candidateModels) {
+    const maxRetries = 3;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        console.log(`Analyzing image using model ${modelName} (Attempt ${attempt}/${maxRetries})...`);
+        const response = await ai.models.generateContent({
+          model: modelName,
+          contents: {
+            parts: [
+              { text: prompt },
+              {
+                inlineData: {
+                  data: data,
+                  mimeType: finalMimeType,
+                },
+              },
+            ],
           },
-        ],
-      },
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            title: {
-              type: Type.STRING,
-              description: `An SEO-driven stock title based on image content and platform rules. Target length is ${settings.titleLength} characters.`
-            },
-            description: {
-              type: Type.STRING,
-              description: "A clear, semantic description of the image content for stock search indexing."
-            },
-            keywords: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-              description: `A flat array of exactly ${settings.keywordCount} highly-relevant stock SEO keywords.`
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                title: {
+                  type: Type.STRING,
+                  description: `An SEO-driven stock title based on image content and platform rules. Target length is ${settings.titleLength} characters.`
+                },
+                description: {
+                  type: Type.STRING,
+                  description: "A clear, semantic description of the image content for stock search indexing."
+                },
+                keywords: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                  description: `A flat array of exactly ${settings.keywordCount} highly-relevant stock SEO keywords.`
+                }
+              },
+              required: ["title", "description", "keywords"]
             }
           },
-          required: ["title", "description", "keywords"]
+        });
+
+        const text = response.text;
+        if (!text) {
+          throw new Error("No response from Gemini");
         }
-      },
-    });
 
-    const text = response.text;
+        return parseAndPolish(text, settings);
+      } catch (error: any) {
+        lastError = error;
+        const errMsg = String(error?.message || error || "").toUpperCase();
+        console.warn(`Attempt ${attempt} on model ${modelName} failed. Error:`, error);
 
-    if (!text) {
-      throw new Error("No response from Gemini");
+        // If it's a fatal key error or invalid argument, don't keep retrying this model
+        if (errMsg.includes("APIKEY") || errMsg.includes("INVALID_ARGUMENT") || errMsg.includes("NOT_FOUND") || errMsg.includes("403")) {
+          break;
+        }
+
+        // Exponential backoff
+        if (attempt < maxRetries) {
+          const delay = Math.pow(2, attempt) * 400;
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
+      }
     }
-
-    return parseAndPolish(text, settings);
-  } catch (error: any) {
-    console.error("Gemini API Error details:", error);
-    if (error?.message?.includes('500') || error?.message?.includes('INTERNAL')) {
-      throw new Error("Gemini is currently experiencing an internal error. Please try again in a few moments or switch to Groq in Settings.");
-    }
-    throw error;
   }
+
+  // If we reach here, all candidate models failed
+  console.error("All Gemini candidate models failed. Last error details:", lastError);
+  const errorMsg = String(lastError?.message || lastError || "");
+  if (errorMsg.includes('503') || errorMsg.includes('UNAVAILABLE') || errorMsg.includes('high demand')) {
+    throw new Error("Gemini is experiencing extremely high demand at the moment. Please retry in a few seconds, or switch to Groq in Settings for instant results.");
+  }
+  if (errorMsg.includes('500') || errorMsg.includes('INTERNAL')) {
+    throw new Error("Gemini is currently experiencing a temporary internal error. Please try again in a few moments or switch to Groq in Settings.");
+  }
+  throw new Error(`Gemini API Error: ${lastError?.message || "Failed to generate metadata"}`);
 }
 
 async function callGroq(base64Image: string, prompt: string, apiKey: string, settings: GenerationSettings) {
