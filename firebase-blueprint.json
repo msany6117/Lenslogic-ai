@@ -1,0 +1,96 @@
+{
+  "entities": {
+    "User": {
+      "title": "User Profile",
+      "description": "User account information and custom settings",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Unique user ID matching auth.uid"
+        },
+        "email": {
+          "type": "string",
+          "description": "User email address"
+        },
+        "role": {
+          "type": "string",
+          "enum": ["user", "admin"],
+          "description": "User role: user or admin"
+        },
+        "savedApiKey": {
+          "type": "string",
+          "description": "Saved Gemini API Key"
+        },
+        "savedGroqKey": {
+          "type": "string",
+          "description": "Saved Groq API Key"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "role", "createdAt"]
+    },
+    "Asset": {
+      "title": "Asset Metadata",
+      "description": "Stock content asset metadata",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "userId": {
+          "type": "string",
+          "description": "Owner of the asset"
+        },
+        "name": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "keywords": {
+          "type": "array"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["Photo", "Video", "Vector"]
+        },
+        "preview": {
+          "type": "string",
+          "description": "Base64 or object URL preview image"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["idle", "generating", "completed", "error"]
+        },
+        "errorMsg": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string"
+        }
+      },
+      "required": ["id", "userId", "name", "type", "status", "createdAt"]
+    }
+  },
+  "firestore": {
+    "users/{userId}": {
+      "schema": {
+        "$ref": "User"
+      },
+      "description": "Collection of user profiles"
+    },
+    "assets/{assetId}": {
+      "schema": {
+        "$ref": "Asset"
+      },
+      "description": "Collection of user assets"
+    }
+  }
+}
