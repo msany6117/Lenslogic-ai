@@ -1,5 +1,5 @@
 import type { ImageMetadata } from "../types";
-import { compressImage } from "../lib/utils";
+import { compressImage, compressToDataUrl } from "../lib/utils";
 
 // Helper to determine the backend API base URL
 export function getApiUrl(path: string): string {
@@ -68,21 +68,14 @@ export async function saveAsset(asset: ImageMetadata, userId: string) {
     if (asset.preview) {
       if (asset.preview.startsWith("blob:")) {
         try {
-          const response = await fetch(asset.preview);
-          const blob = await response.blob();
-          const base64Data = await new Promise<string>((resolve, reject) => {
-            const r = new FileReader();
-            r.onload = () => resolve(r.result as string);
-            r.onerror = reject;
-            r.readAsDataURL(blob);
-          });
-          compressedPreview = await compressImage(base64Data, 400, 400, 0.7);
+          // Instantly compress the blob: URL on the client side!
+          compressedPreview = await compressToDataUrl(asset.preview, 400, 400, 0.7);
           
           // CRITICAL OPTIMIZATION: Mutate the local asset.preview with the compressed base64
           // so subsequent calls to saveAsset for this asset immediately skip compression.
           asset.preview = compressedPreview;
         } catch (e) {
-          console.warn("Failed to fetch or compress blob preview:", e);
+          console.warn("Failed to compress blob preview:", e);
         }
       } else if (asset.preview.startsWith("data:image")) {
         // ALREADY COMPRESSED! Bypassing is extremely fast and saves 100% of CPU cycles

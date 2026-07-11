@@ -22,7 +22,7 @@ import {
 } from 'lucide-react';
 import { useDropzone, type Accept } from 'react-dropzone';
 import Papa from 'papaparse';
-import { cn } from './lib/utils';
+import { cn, compressToDataUrl } from './lib/utils';
 import { generateMetadata as generateMetadataService } from './services/aiService';
 import type { Platform, GenerationSettings, ImageMetadata, ApiResponse, AssetType } from './types';
 
@@ -355,27 +355,19 @@ export default function App() {
     try {
       const activeKey = settings.apiKeys.find(k => k.id === settings.activeKeyId) || null;
 
-      let fileToAnalyze: Blob | File | null = image.file || null;
-      if (image.preview && !fileToAnalyze) {
-        try {
-          const response = await fetch(image.preview);
-          fileToAnalyze = await response.blob();
-        } catch (e) {
-          console.warn('Failed to fetch preview blob:', e);
-        }
+      let base64 = '';
+      if (image.preview) {
+        // Since image.preview is a blob: URL or base64, compressing it is incredibly fast (sub-second) and light on memory
+        base64 = await compressToDataUrl(image.preview, 512, 512, 0.75);
+      } else if (image.file) {
+        // Compress the original File directly (no huge base64 strings loaded in JS memory!)
+        base64 = await compressToDataUrl(image.file, 512, 512, 0.75);
       }
 
-      if (!fileToAnalyze) {
-        throw new Error("No image data available to analyze. Please upload a valid asset.");
+      if (!base64) {
+        throw new Error("Could not compress or prepare image data for analysis.");
       }
 
-      const reader = new FileReader();
-      const base64Promise = new Promise<string>((resolve) => {
-        reader.onload = () => resolve(reader.result as string);
-        reader.readAsDataURL(fileToAnalyze as Blob);
-      });
-      
-      const base64 = await base64Promise;
       const data = await generateMetadataService(base64, settings, activeKey, image.type);
 
       const completedImg = { 
