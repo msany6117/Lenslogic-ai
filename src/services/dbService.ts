@@ -58,15 +58,16 @@ export async function saveAsset(asset: ImageMetadata, userId: string) {
             r.readAsDataURL(blob);
           });
           compressedPreview = await compressImage(base64Data, 400, 400, 0.7);
+          
+          // CRITICAL OPTIMIZATION: Mutate the local asset.preview with the compressed base64
+          // so subsequent calls to saveAsset for this asset immediately skip compression.
+          asset.preview = compressedPreview;
         } catch (e) {
           console.warn("Failed to fetch or compress blob preview:", e);
         }
       } else if (asset.preview.startsWith("data:image")) {
-        try {
-          compressedPreview = await compressImage(asset.preview, 400, 400, 0.7);
-        } catch (e) {
-          console.warn("Failed to compress data preview:", e);
-        }
+        // ALREADY COMPRESSED! Bypassing is extremely fast and saves 100% of CPU cycles
+        compressedPreview = asset.preview;
       }
     }
 

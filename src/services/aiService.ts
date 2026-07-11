@@ -1,5 +1,6 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import type { GenerationSettings, ApiKeyEntry, AssetType } from "../types";
+import { compressImage } from "../lib/utils";
 
 export async function generateMetadata(
   base64Image: string,
@@ -201,44 +202,76 @@ async function callGemini(base64Image: string, prompt: string, apiKey: string, s
 }
 
 async function callGroq(base64Image: string, prompt: string, apiKey: string, settings: GenerationSettings) {
-  // Groq vision model - Update to 90b which is usually more stable
-  const model = "llama-3.2-90b-vision-preview";
-  
-  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: model,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: prompt },
-            {
-              type: "image_url",
-              image_url: {
-                url: base64Image
-              }
-            }
-          ]
-        }
-      ],
-      response_format: { type: "json_object" }
-    })
-  });
-
-  if (!response.ok) {
-    const errorBody = await response.json();
-    throw new Error(`Groq API Error: ${errorBody?.error?.message || response.statusText}`);
+  // Compress the image specifically for Groq to guarantee it fits under Groq's payload limit (avoid "Request Entity Too Large" errors)
+  let compressedForGroq = base64Image;
+  try {
+    compressedForGroq = await compressImage(base64Image, 300, 300, 0.5);
+  } catch (err) {
+    console.warn("Failed to compress image specifically for Groq:", err);
   }
 
-  const result = await response.json();
-  const content = result.choices[0].message.content;
+  // Robust list of active Groq vision models to try
+  const candidateModels = [
+    "llama-3.2-90b-vision-instruct",
+    "llama-3.2-11b-vision-preview"
+  ];
   
-  return parseAndPolish(content, settings);
+  let lastError: any = null;
+
+  for (const modelName of candidateModels) {
+    try {
+      console.log(`Analyzing image using Groq model ${modelName}...`);
+      const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: modelName,
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: prompt },
+                {
+                  type: "image_url",
+                  image_url: {
+                    url: compressedForGroq
+                  }
+                }
+              ]
+            }
+          ],
+          response_format: { type: "json_object" }
+        })
+      });
+
+      if (!response.ok) {
+        const errorBody = await response.json().catch(() => ({}));
+        throw new Error(errorBody?.error?.message || response.statusText || `HTTP ${response.status}`);
+      }
+
+      const result = await response.json();
+      const content = result.choices?.[0]?.message?.content;
+      if (!content) {
+        throw new Error("No response content from Groq");
+      }
+      
+      return parseAndPolish(content, settings);
+    } catch (error: any) {
+      lastError = error;
+      const errMsg = String(error?.message || "").toUpperCase();
+      console.warn(`Groq model ${modelName} failed. Error:`, error);
+      
+      // If it's an API Key or permission error, do not fallback to other models
+      if (errMsg.includes("API_KEY") || errMsg.includes("403") || errMsg.includes("UNAUTHORIZED")) {
+        break;
+      }
+    }
+  }
+
+  throw new Error(`Groq API Error: ${lastError?.message || "Failed to generate metadata via Groq"}`);
 }
 
 function cleanAndRepairJson(str: string): string {

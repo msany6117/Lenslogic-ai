@@ -72,12 +72,23 @@ function loadDb() {
   }
 }
 
+let saveTimeout: NodeJS.Timeout | null = null;
+
 function saveDb() {
-  try {
-    fs.writeFileSync(DB_PATH, JSON.stringify(database, null, 2), "utf8");
-  } catch (e) {
-    console.error("Error saving database:", e);
+  if (saveTimeout) {
+    clearTimeout(saveTimeout);
   }
+  saveTimeout = setTimeout(() => {
+    try {
+      fs.writeFile(DB_PATH, JSON.stringify(database, null, 2), "utf8", (err) => {
+        if (err) {
+          console.error("Error saving database in background:", err);
+        }
+      });
+    } catch (e) {
+      console.error("Error scheduling database save:", e);
+    }
+  }, 300);
 }
 
 loadDb();

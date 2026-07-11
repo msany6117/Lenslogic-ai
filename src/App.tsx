@@ -271,18 +271,7 @@ export default function App() {
         });
       }
 
-      // Save newly created assets to Firestore
-      if (user) {
-        for (const asset of newAssets) {
-          try {
-            await saveAsset(asset, user.uid);
-          } catch (e) {
-            console.error("Failed to save asset to Firestore:", e);
-          }
-        }
-      }
-
-      // Check if any of these new reference images should update existing EPS/Videos
+      // Update React state first so UI switches tabs and renders new elements instantly!
       setImages(prev => {
         const updatedPrev = prev.map(img => {
           const imgName = img.file?.name || img.fileName || '';
@@ -305,6 +294,28 @@ export default function App() {
         });
         return [...updatedPrev, ...newAssets];
       });
+
+      // Save newly created assets to local Express backend asynchronously in background with a concurrency pool of 5
+      if (user) {
+        const queue = [...newAssets];
+        const CONCURRENT_SAVES = 5;
+        const saveWorker = async () => {
+          while (queue.length > 0) {
+            const asset = queue.shift();
+            if (!asset) break;
+            try {
+              await saveAsset(asset, user.uid);
+            } catch (e) {
+              console.error("Failed to save asset in background:", e);
+            }
+          }
+        };
+
+        // Run background workers in parallel without blocking UI response
+        for (let i = 0; i < Math.min(CONCURRENT_SAVES, queue.length); i++) {
+          saveWorker();
+        }
+      }
     };
 
     processFiles();
@@ -1115,7 +1126,6 @@ const MetadataRow = React.memo(function MetadataRow({
 
   return (
     <motion.div 
-      layout
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       className="hover:bg-white/[0.02] transition-colors group relative"
