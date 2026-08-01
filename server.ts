@@ -4,6 +4,7 @@ import path from "path";
 import dotenv from "dotenv";
 import fs from "fs";
 import crypto from "crypto";
+import { GoogleGenAI, Type } from "@google/genai";
 
 dotenv.config();
 
@@ -314,6 +315,111 @@ async function startServer() {
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: "Failed to fetch admin assets." });
+    }
+  });
+
+  // --- FAST AI METADATA GENERATION ENDPOINT ---
+  app.post("/api/generate-metadata", async (req, res) => {
+    try {
+      const { base64Image, settings, apiKey, assetType } = req.body;
+
+      const effectiveKey = apiKey || process.env.GEMINI_API_KEY;
+      if (!effectiveKey) {
+        return res.status(400).json({ error: "No API Key provided. Please add a Gemini or Groq key in Settings." });
+      }
+
+      const ai = new GoogleGenAI({
+        apiKey: effectiveKey,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          }
+        }
+      });
+
+      const [header, data] = (base64Image || '').split(',');
+      let mimeType = header?.match(/:(.*?);/)?.[1] || 'image/jpeg';
+      if (!mimeType.startsWith('image/')) {
+        mimeType = 'image/jpeg';
+      }
+
+      const platform = settings?.platform || 'Adobe Stock';
+      const titleLength = settings?.titleLength || '20-200';
+      const keywordCount = settings?.keywordCount || 30;
+
+      const prompt = `
+        You are a world-class Stock Content SEO Expert. 
+        Analyze the provided image and generate metadata optimized specifically for ${platform}.
+        
+        Asset Context:
+        - Target Platform: ${platform}
+        - Asset Type: ${assetType || 'Photo'}
+        - Title Length: ${titleLength} characters.
+        - Keyword Count: Exactly ${keywordCount} keywords.
+        - Prefix: ${settings?.prefix || 'None'}
+        - Suffix: ${settings?.suffix || 'None'}
+        - Prohibited Terms: ${settings?.negativeKeywords || 'None'}
+
+        Output Requirements:
+        - Return ONLY a JSON object with "title", "description", and "keywords".
+      `;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3.6-flash",
+        contents: {
+          parts: [
+            { text: prompt },
+            {
+              inlineData: {
+                data: data || '',
+                mimeType
+              }
+            }
+          ]
+        },
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              title: {
+                type: Type.STRING,
+                description: `An SEO-driven stock title based on image content and platform rules.`
+              },
+              description: {
+                type: Type.STRING,
+                description: "A clear description for stock search indexing."
+              },
+              keywords: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: `A flat array of exactly ${keywordCount} keywords.`
+              }
+            },
+            required: ["title", "description", "keywords"]
+          }
+        }
+      });
+
+      const text = response.text;
+      if (!text) {
+        throw new Error("No response returned from Gemini API");
+      }
+
+      const result = JSON.parse(text);
+
+      // Apply title prefix/suffix if specified
+      if (settings?.prefix && !result.title.startsWith(settings.prefix)) {
+        result.title = `${settings.prefix} ${result.title}`;
+      }
+      if (settings?.suffix && !result.title.endsWith(settings.suffix)) {
+        result.title = `${result.title} ${settings.suffix}`;
+      }
+
+      res.json(result);
+    } catch (err: any) {
+      console.error("Server AI generation error:", err);
+      res.status(500).json({ error: err.message || "AI metadata generation failed" });
     }
   });
 

@@ -19,6 +19,30 @@ export async function generateMetadata(
     console.warn("Failed to compress image for AI service, sending original:", err);
   }
 
+  // First attempt server-side endpoint for max speed and zero key exposure overhead
+  try {
+    const keyToUse = activeKey?.key || settings.apiKeys.find(k => k.key)?.key || '';
+    const response = await fetch("/api/generate-metadata", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        base64Image: optimizedBase64,
+        settings,
+        apiKey: keyToUse,
+        assetType
+      })
+    });
+
+    if (response.ok) {
+      const serverResult = await response.json();
+      if (serverResult && serverResult.title && Array.isArray(serverResult.keywords)) {
+        return parseAndPolish(JSON.stringify(serverResult), settings);
+      }
+    }
+  } catch (serverErr) {
+    console.warn("Server-side generation endpoint unavailable, continuing with client-configured keys:", serverErr);
+  }
+
   // Build a prioritized list of keys to try
   const keysToTry: ApiKeyEntry[] = [];
   const allKeys = settings.apiKeys || [];
@@ -129,7 +153,7 @@ async function callGemini(base64Image: string, prompt: string, apiKey: string, s
   }
 
   // Highly robust list of model candidates to fail over
-  const candidateModels = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-3.5-flash"];
+  const candidateModels = ["gemini-3.6-flash", "gemini-3.1-pro-preview"];
   let lastError: any = null;
 
   for (const modelName of candidateModels) {

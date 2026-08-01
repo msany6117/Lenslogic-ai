@@ -2,5 +2,5 @@
   "name": "LensLogic AI",
   "description": "Professional Desktop Studio for AI-powered stock image metadata. Optimized for batch processing of photos, videos, and vectors.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["AI Image Analysis", "Batch Metadata Generation", "CSV Export"]
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API", "AI Image Analysis", "Batch Metadata Generation", "CSV Export"]
 }
