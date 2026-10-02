@@ -174,7 +174,7 @@ async function startServer() {
   // Update Settings Endpoint
   app.post("/api/users/update", (req, res) => {
     try {
-      const { uid, email, savedSettings } = req.body;
+      const { uid, email, savedSettings, role } = req.body;
       if (!uid) {
         return res.status(400).json({ error: "User ID is required." });
       }
@@ -182,17 +182,25 @@ async function startServer() {
       const userIndex = database.users.findIndex(u => u.uid === uid);
       if (userIndex === -1) {
         // If they don't exist (e.g. guest or newly synced session), create them
-        const role = email?.toLowerCase().trim() === "msany6117@gmail.com" ? "admin" : "user";
+        const assignedRole = role || (email?.toLowerCase().trim() === "msany6117@gmail.com" ? "admin" : "user");
         database.users.push({
           uid,
           email: email || "anonymous@lenslogic.ai",
           passwordHash: "",
-          role: role as "user" | "admin",
+          role: assignedRole,
           savedSettings: savedSettings || null,
           createdAt: new Date().toISOString()
         });
       } else {
-        database.users[userIndex].savedSettings = savedSettings;
+        if (savedSettings !== undefined) {
+          database.users[userIndex].savedSettings = savedSettings;
+        }
+        if (role) {
+          database.users[userIndex].role = role;
+        }
+        if (email) {
+          database.users[userIndex].email = email;
+        }
       }
       saveDb();
       res.json({ success: true });
@@ -364,42 +372,59 @@ async function startServer() {
         - Return ONLY a JSON object with "title", "description", and "keywords".
       `;
 
-      const response = await ai.models.generateContent({
-        model: "gemini-3.6-flash",
-        contents: {
-          parts: [
-            { text: prompt },
-            {
-              inlineData: {
-                data: data || '',
-                mimeType
+      // Try gemini-3.8-flash first for blazing-fast generation, then fallback if needed
+      const candidateModels = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"];
+      let response: any = null;
+      let lastErr: any = null;
+
+      for (const modelName of candidateModels) {
+        try {
+          response = await ai.models.generateContent({
+            model: modelName,
+            contents: {
+              parts: [
+                { text: prompt },
+                {
+                  inlineData: {
+                    data: data || '',
+                    mimeType
+                  }
+                }
+              ]
+            },
+            config: {
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  title: {
+                    type: Type.STRING,
+                    description: `An SEO-driven stock title based on image content and platform rules.`
+                  },
+                  description: {
+                    type: Type.STRING,
+                    description: "A clear description for stock search indexing."
+                  },
+                  keywords: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                    description: `A flat array of exactly ${keywordCount} keywords.`
+                  }
+                },
+                required: ["title", "description", "keywords"]
               }
             }
-          ]
-        },
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              title: {
-                type: Type.STRING,
-                description: `An SEO-driven stock title based on image content and platform rules.`
-              },
-              description: {
-                type: Type.STRING,
-                description: "A clear description for stock search indexing."
-              },
-              keywords: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-                description: `A flat array of exactly ${keywordCount} keywords.`
-              }
-            },
-            required: ["title", "description", "keywords"]
-          }
+          });
+          if (response?.text) break;
+        } catch (e: any) {
+          lastErr = e;
+          console.warn(`Model ${modelName} in server generation failed:`, e?.message || e);
         }
-      });
+      }
+
+      if (!response || !response.text) {
+        throw new Error(lastErr?.message || "No response returned from Gemini API");
+      }
 
       const text = response.text;
       if (!text) {

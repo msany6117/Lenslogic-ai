@@ -50,16 +50,26 @@ export default function AdminPanel() {
     loadData();
   };
 
-  const toggleUserRole = async (user: any) => {
-    const newRole = user.role === 'admin' ? 'user' : 'admin';
-    if (confirm(`Are you sure you want to change ${user.email}'s role to ${newRole}?`)) {
-      try {
-        await saveUserProfile(user.uid, user.email, { savedSettings: user.savedSettings });
-        // Update role locally in state
-        setUsers(prev => prev.map(u => u.uid === user.uid ? { ...u, role: newRole } : u));
-      } catch (err) {
-        alert("Failed to update role: " + err);
-      }
+  const [roleChangeTarget, setRoleChangeTarget] = useState<{ user: any; newRole: 'user' | 'admin' } | null>(null);
+  const [roleUpdating, setRoleUpdating] = useState(false);
+  const [roleError, setRoleError] = useState<string | null>(null);
+
+  const confirmToggleUserRole = async () => {
+    if (!roleChangeTarget) return;
+    setRoleUpdating(true);
+    setRoleError(null);
+    try {
+      await saveUserProfile(roleChangeTarget.user.uid, roleChangeTarget.user.email, {
+        savedSettings: roleChangeTarget.user.savedSettings,
+        role: roleChangeTarget.newRole
+      });
+      // Update role locally in state
+      setUsers(prev => prev.map(u => u.uid === roleChangeTarget.user.uid ? { ...u, role: roleChangeTarget.newRole } : u));
+      setRoleChangeTarget(null);
+    } catch (err: any) {
+      setRoleError(err?.message || "Failed to update role");
+    } finally {
+      setRoleUpdating(false);
     }
   };
 
@@ -270,7 +280,7 @@ export default function AdminPanel() {
                       <td className="p-4 text-xs font-mono text-slate-300">{userAssetsCount}</td>
                       <td className="p-4">
                         <button
-                          onClick={() => toggleUserRole(user)}
+                          onClick={() => setRoleChangeTarget({ user, newRole: user.role === 'admin' ? 'user' : 'admin' })}
                           className="px-2.5 py-1.5 bg-white/5 hover:bg-white/10 text-[10px] font-bold uppercase tracking-wider text-indigo-400 hover:text-indigo-300 rounded-lg border border-white/5 cursor-pointer transition-all"
                         >
                           Toggle Role
@@ -290,6 +300,50 @@ export default function AdminPanel() {
           </table>
         </div>
       </div>
+
+      {/* Role Change Modal (Replaces native window.confirm) */}
+      {roleChangeTarget && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-md z-50 flex items-center justify-center p-4">
+          <div className="bg-[#110f17] border border-white/10 rounded-2xl max-w-sm w-full p-6 shadow-2xl relative overflow-hidden">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-10 h-10 rounded-xl bg-indigo-500/10 flex items-center justify-center border border-indigo-500/20 shrink-0">
+                <Shield className="text-indigo-400 w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-base font-bold text-white">Change Account Role</h3>
+                <p className="text-xs text-slate-400">{roleChangeTarget.user.email}</p>
+              </div>
+            </div>
+
+            <p className="text-slate-300 text-xs mb-4 leading-relaxed">
+              Are you sure you want to change this creator's role to <span className="font-bold text-indigo-300 uppercase">{roleChangeTarget.newRole}</span>?
+            </p>
+
+            {roleError && (
+              <div className="mb-4 p-2.5 rounded-lg bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs">
+                {roleError}
+              </div>
+            )}
+
+            <div className="flex justify-end gap-2.5">
+              <button
+                disabled={roleUpdating}
+                onClick={() => { setRoleChangeTarget(null); setRoleError(null); }}
+                className="px-3.5 py-2 bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 rounded-xl text-xs font-semibold cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                disabled={roleUpdating}
+                onClick={confirmToggleUserRole}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold shadow-lg shadow-indigo-600/30 flex items-center gap-2 cursor-pointer disabled:opacity-50"
+              >
+                {roleUpdating ? "Updating..." : `Confirm ${roleChangeTarget.newRole.toUpperCase()}`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

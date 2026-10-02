@@ -3,21 +3,18 @@ import { compressImage, compressToDataUrl } from "../lib/utils";
 
 // Helper to determine the backend API base URL
 export function getApiUrl(path: string): string {
-  const envUrl = (import.meta as any).env?.VITE_API_URL;
-  // process.env.APP_URL is injected via Vite's define config
-  const appUrl = (typeof process !== "undefined" && process.env?.APP_URL) || "";
-  const localUrl = localStorage.getItem("LENS_LOGIC_API_URL");
-  
-  // Choose the best available base URL
-  const base = (envUrl || localUrl || appUrl || "").replace(/\/$/, "");
-  
-  // If we don't have any base configured, use relative path as is.
-  // When on localhost, do NOT prefix relative path because the backend dev server is on the same port/origin
-  if (!base || window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1") {
-    return path;
-  }
-  
-  return `${base}${path}`;
+  try {
+    const localUrl = localStorage.getItem("LENS_LOGIC_API_URL");
+    if (localUrl && (localUrl.startsWith("http://") || localUrl.startsWith("https://"))) {
+      return `${localUrl.replace(/\/$/, "")}${path}`;
+    }
+    const envUrl = (import.meta as any).env?.VITE_API_URL;
+    if (envUrl && (envUrl.startsWith("http://") || envUrl.startsWith("https://"))) {
+      return `${envUrl.replace(/\/$/, "")}${path}`;
+    }
+  } catch (_) {}
+  // Default to relative path which is always safe and on the same origin (no CORS or invalid URL issues)
+  return path;
 }
 
 // Save or update user profile settings
@@ -25,6 +22,7 @@ export async function saveUserProfile(uid: string, email: string, data?: Partial
   savedApiKey: string;
   savedGroqKey: string;
   savedSettings: any;
+  role: "user" | "admin";
 }>) {
   try {
     const res = await fetch(getApiUrl("/api/users/update"), {
@@ -33,7 +31,8 @@ export async function saveUserProfile(uid: string, email: string, data?: Partial
       body: JSON.stringify({
         uid,
         email,
-        savedSettings: data?.savedSettings || null
+        savedSettings: data?.savedSettings || null,
+        role: data?.role
       })
     });
     if (!res.ok) {

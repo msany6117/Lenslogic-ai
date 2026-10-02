@@ -49,6 +49,7 @@ export default function App() {
 
   const [images, setImages] = useState<ImageMetadata[]>([]);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [activeTab, setActiveTab] = useState<'upload' | 'results' | 'settings' | 'admin'>('upload');
   const [isProcessingAll, setIsProcessingAll] = useState(false);
   const [settings, setSettings] = useState<GenerationSettings>(() => {
@@ -131,23 +132,26 @@ export default function App() {
     }
   }, [settings, user]);
 
-  const handleSignOut = async () => {
-    if (window.confirm("Are you sure you want to reset your session? All current assets in your workspace will be cleared.")) {
-      localStorage.removeItem('lenslogic_user');
-      setImages([]);
-      setActiveTab('upload');
-      const guestUid = 'guest_' + Math.random().toString(36).substring(2, 11);
-      const guestUser = {
-        uid: guestUid,
-        email: 'guest@lenslogic.ai',
-        role: 'user',
-        savedSettings: null,
-        createdAt: new Date().toISOString()
-      };
-      localStorage.setItem('lenslogic_user', JSON.stringify(guestUser));
-      setUser(guestUser);
-      setUserProfile(guestUser);
-    }
+  const handleSignOut = () => {
+    setShowResetConfirm(true);
+  };
+
+  const confirmResetSession = () => {
+    localStorage.removeItem('lenslogic_user');
+    setImages([]);
+    setActiveTab('upload');
+    const guestUid = 'guest_' + Math.random().toString(36).substring(2, 11);
+    const guestUser = {
+      uid: guestUid,
+      email: 'guest@lenslogic.ai',
+      role: 'user',
+      savedSettings: null,
+      createdAt: new Date().toISOString()
+    };
+    localStorage.setItem('lenslogic_user', JSON.stringify(guestUser));
+    setUser(guestUser);
+    setUserProfile(guestUser);
+    setShowResetConfirm(false);
   };
 
   // File Upload Handling
@@ -560,6 +564,37 @@ export default function App() {
                 className="px-4 py-2.5 bg-rose-600 hover:bg-rose-500 text-white rounded-xl text-sm font-bold transition-all shadow-lg shadow-rose-600/30 cursor-pointer"
               >
                 Yes, Clear All
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Custom Reset Session Confirmation Dialog */}
+      {showResetConfirm && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-md z-50 flex items-center justify-center p-4">
+          <div className="bg-[#110f17] border border-white/10 rounded-2xl max-w-sm w-full p-6 shadow-2xl relative overflow-hidden">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-10 h-10 rounded-xl bg-amber-500/10 flex items-center justify-center border border-amber-500/20 shrink-0">
+                <RotateCcw className="text-amber-400 w-5 h-5" />
+              </div>
+              <h3 className="text-lg font-bold text-white">Reset Session?</h3>
+            </div>
+            <p className="text-slate-400 text-sm mb-6 leading-relaxed">
+              Are you sure you want to reset your studio session? Your current workspace assets will be cleared and a fresh guest session will start.
+            </p>
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={() => setShowResetConfirm(false)}
+                className="px-4 py-2.5 bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 rounded-xl text-sm font-semibold transition-all cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmResetSession}
+                className="px-4 py-2.5 bg-amber-600 hover:bg-amber-500 text-white rounded-xl text-sm font-bold transition-all shadow-lg shadow-amber-600/30 cursor-pointer"
+              >
+                Reset Session
               </button>
             </div>
           </div>

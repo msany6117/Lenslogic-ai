@@ -2,6 +2,39 @@ import { GoogleGenAI, Type } from "@google/genai";
 import type { GenerationSettings, ApiKeyEntry, AssetType } from "../types";
 import { compressImage } from "../lib/utils";
 
+export function buildSeoPrompt(settings: GenerationSettings, assetType: AssetType = 'Photo'): string {
+  return `
+    You are a world-class Stock Content SEO Expert. 
+    Analyze the provided image and generate metadata optimized specifically for ${settings.platform}.
+    
+    Asset Context:
+    - Target Platform: ${settings.platform}
+    - Asset Type: ${assetType}
+    - Platform Rules: ${settings.platform === 'Adobe Stock' ? 'Focus on commercial appeal, avoid numbers/camera info in title.' : ''}
+    ${settings.platform === 'Shutterstock' ? 'Requires descriptive titles, keywords should be noun/adjective heavy.' : ''}
+    ${settings.platform === 'Freepik' ? 'Highly descriptive, focus on use-case and design elements.' : ''}
+    ${settings.platform === 'Getty Images' ? 'Editorial or commercial clarity, precise keywords.' : ''}
+    - Title Length: ${settings.titleLength} characters.
+    - Keyword Count: Exactly ${settings.keywordCount} keywords.
+    - PNG / Transparent Background Rule:
+      Check if the image has a transparent background (as is common with PNGs/vectors/graphics/isolated illustrations). If the background is transparent, describe it as "isolated on a transparent background", "transparent PNG", or "isolated graphic". Do NOT mention "white background" or "isolated on white" if the background is actually transparent. Only describe it as "white background" or "isolated on white" if there is a solid white background.
+    - Asset specific instruction: 
+      ${assetType === 'Vector' ? 'Focus on technical execution, usage as a design asset (SVG/EPS), and scalability. Mention "vector", "illustration", and specific design styles (flat, isometric, etc.).' : ''} 
+      ${assetType === 'Illustration' ? 'Focus on artistic style, mood, and digital/hand-drawn textures. Use descriptive adjectives (watercolor, charcoal, digital art).' : ''}
+      ${assetType === 'Video' ? 'Focus on motion, camera movement (pan, tilt, zoom), lighting, and the "story" captured in the clip. This is for stock footage SEO.' : ''}
+    - Keywords must be: SEO optimized, comma-separated, high-traffic terms, excluding stop words.
+    - Prefix: ${settings.prefix || 'None'}
+    - Suffix: ${settings.suffix || 'None'}
+    - Prohibited Terms (Exclude these): ${settings.negativeKeywords || 'None'}
+
+    Output Requirements:
+    - Return ONLY a raw JSON object string.
+    - "title": A powerful, SEO-driven title based on image content and platform rules.
+    - "description": A clear, semantic description for search engine indexing.
+    - "keywords": A flat array of ${settings.keywordCount} strings.
+  `;
+}
+
 export async function generateMetadata(
   base64Image: string,
   settings: GenerationSettings,
@@ -19,16 +52,25 @@ export async function generateMetadata(
     console.warn("Failed to compress image for AI service, sending original:", err);
   }
 
-  // First attempt server-side endpoint for max speed and zero key exposure overhead
+  const prompt = buildSeoPrompt(settings, assetType);
+
+  // If the user explicitly has a Groq key active, bypass Gemini server route and call Groq immediately
+  if (activeKey && activeKey.provider === 'Groq' && activeKey.key) {
+    return await callGroq(optimizedBase64, prompt, activeKey.key, settings);
+  }
+
+  // Attempt server-side endpoint for max speed and zero key exposure overhead
   try {
-    const keyToUse = activeKey?.key || settings.apiKeys.find(k => k.key)?.key || '';
+    const geminiKey = (activeKey?.provider === 'Gemini' ? activeKey.key : null) || 
+                      settings.apiKeys.find(k => k.provider === 'Gemini' && k.key)?.key || '';
+    
     const response = await fetch("/api/generate-metadata", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         base64Image: optimizedBase64,
         settings,
-        apiKey: keyToUse,
+        apiKey: geminiKey,
         assetType
       })
     });
@@ -38,6 +80,9 @@ export async function generateMetadata(
       if (serverResult && serverResult.title && Array.isArray(serverResult.keywords)) {
         return parseAndPolish(JSON.stringify(serverResult), settings);
       }
+    } else {
+      const errData = await response.json().catch(() => ({}));
+      console.warn("Server generation returned non-ok status:", response.status, errData);
     }
   } catch (serverErr) {
     console.warn("Server-side generation endpoint unavailable, continuing with client-configured keys:", serverErr);
@@ -81,37 +126,6 @@ export async function generateMetadata(
     throw new Error("No valid API keys found. Please add at least one Gemini or Groq API key in Settings.");
   }
 
-  const prompt = `
-    You are a world-class Stock Content SEO Expert. 
-    Analyze the provided image and generate metadata optimized specifically for ${settings.platform}.
-    
-    Asset Context:
-    - Target Platform: ${settings.platform}
-    - Asset Type: ${assetType}
-    - Platform Rules: ${settings.platform === 'Adobe Stock' ? 'Focus on commercial appeal, avoid numbers/camera info in title.' : ''}
-    ${settings.platform === 'Shutterstock' ? 'Requires descriptive titles, keywords should be noun/adjective heavy.' : ''}
-    ${settings.platform === 'Freepik' ? 'Highly descriptive, focus on use-case and design elements.' : ''}
-    ${settings.platform === 'Getty Images' ? 'Editorial or commercial clarity, precise keywords.' : ''}
-    - Title Length: ${settings.titleLength} characters.
-    - Keyword Count: Exactly ${settings.keywordCount} keywords.
-    - PNG / Transparent Background Rule:
-      Check if the image has a transparent background (as is common with PNGs/vectors/graphics/isolated illustrations). If the background is transparent, describe it as "isolated on a transparent background", "transparent PNG", or "isolated graphic". Do NOT mention "white background" or "isolated on white" if the background is actually transparent. Only describe it as "white background" or "isolated on white" if there is a solid white background.
-    - Asset specific instruction: 
-      ${assetType === 'Vector' ? 'Focus on technical execution, usage as a design asset (SVG/EPS), and scalability. Mention "vector", "illustration", and specific design styles (flat, isometric, etc.).' : ''} 
-      ${assetType === 'Illustration' ? 'Focus on artistic style, mood, and digital/hand-drawn textures. Use descriptive adjectives (watercolor, charcoal, digital art).' : ''}
-      ${assetType === 'Video' ? 'Focus on motion, camera movement (pan, tilt, zoom), lighting, and the "story" captured in the clip. This is for stock footage SEO.' : ''}
-    - Keywords must be: SEO optimized, comma-separated, high-traffic terms, excluding stop words.
-    - Prefix: ${settings.prefix || 'None'}
-    - Suffix: ${settings.suffix || 'None'}
-    - Prohibited Terms (Exclude these): ${settings.negativeKeywords || 'None'}
-
-    Output Requirements:
-    - Return ONLY a raw JSON object string.
-    - "title": A powerful, SEO-driven title based on image content and platform rules.
-    - "description": A clear, semantic description for search engine indexing.
-    - "keywords": A flat array of ${settings.keywordCount} strings.
-  `;
-
   let lastError: any = null;
   
   for (const keyEntry of uniqueKeys) {
@@ -152,12 +166,12 @@ async function callGemini(base64Image: string, prompt: string, apiKey: string, s
     }
   }
 
-  // Highly robust list of model candidates to fail over
-  const candidateModels = ["gemini-3.6-flash", "gemini-3.1-pro-preview"];
+  // Ultra-fast model list using official, state-of-the-art Gemini models
+  const candidateModels = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite", "gemini-3.1-pro-preview"];
   let lastError: any = null;
 
   for (const modelName of candidateModels) {
-    const maxRetries = 2; // Reduced from 3 to 2 to minimize wait times on transient errors
+    const maxRetries = 1; // 1 attempt per candidate for instantaneous fallback if throttled
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
         console.log(`Analyzing image using model ${modelName} (Attempt ${attempt}/${maxRetries})...`);
