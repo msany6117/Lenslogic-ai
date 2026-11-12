@@ -1,4 +1,3 @@
-import { GoogleGenAI, Type } from "@google/genai";
 import type { GenerationSettings, ApiKeyEntry, AssetType } from "../types";
 import { compressImage } from "../lib/utils";
 
@@ -43,8 +42,7 @@ export async function generateMetadata(
 ): Promise<{ title: string; description: string; keywords: string[] }> {
   
   // Compress image to a highly optimized standard size (max 512px) right at the start.
-  // This reduces the payload size by over 99% (e.g. from 10MB to 30KB),
-  // which makes both the network upload and Gemini/Groq model processing superfast (typically under 2 seconds).
+  // This reduces payload size by ~99% (sub-second network transfer).
   let optimizedBase64 = base64Image;
   try {
     optimizedBase64 = await compressImage(base64Image, 512, 512, 0.75);
@@ -54,208 +52,38 @@ export async function generateMetadata(
 
   const prompt = buildSeoPrompt(settings, assetType);
 
-  // If the user explicitly has a Groq key active, bypass Gemini server route and call Groq immediately
+  // If the user explicitly has a Groq key active, use Groq provider directly
   if (activeKey && activeKey.provider === 'Groq' && activeKey.key) {
     return await callGroq(optimizedBase64, prompt, activeKey.key, settings);
   }
 
-  // Attempt server-side endpoint for max speed and zero key exposure overhead
-  try {
-    const geminiKey = (activeKey?.provider === 'Gemini' ? activeKey.key : null) || 
-                      settings.apiKeys.find(k => k.provider === 'Gemini' && k.key)?.key || '';
-    
-    const response = await fetch("/api/generate-metadata", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        base64Image: optimizedBase64,
-        settings,
-        apiKey: geminiKey,
-        assetType
-      })
-    });
+  // All Gemini AI operations are handled on the server via /api/generate-metadata
+  const geminiKey = (activeKey?.provider === 'Gemini' ? activeKey.key : null) || 
+                    settings.apiKeys?.find(k => k.provider === 'Gemini' && k.key)?.key || undefined;
 
-    if (response.ok) {
-      const serverResult = await response.json();
-      if (serverResult && serverResult.title && Array.isArray(serverResult.keywords)) {
-        return parseAndPolish(JSON.stringify(serverResult), settings);
-      }
-    } else {
-      const errData = await response.json().catch(() => ({}));
-      console.warn("Server generation returned non-ok status:", response.status, errData);
-    }
-  } catch (serverErr) {
-    console.warn("Server-side generation endpoint unavailable, continuing with client-configured keys:", serverErr);
+  const response = await fetch("/api/generate-metadata", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      base64Image: optimizedBase64,
+      settings,
+      apiKey: geminiKey,
+      assetType
+    })
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    const errorMessage = errorData.error || `Server generation failed (Status: ${response.status})`;
+    throw new Error(errorMessage);
   }
 
-  // Build a prioritized list of keys to try
-  const keysToTry: ApiKeyEntry[] = [];
-  const allKeys = settings.apiKeys || [];
-  const active = activeKey && activeKey.key ? activeKey : null;
-  
-  const geminiKeys = allKeys.filter(k => k.provider === 'Gemini' && k.key);
-  const groqKeys = allKeys.filter(k => k.provider === 'Groq' && k.key);
-  
-  // Try active key first if it is Gemini
-  if (active && active.provider === 'Gemini') {
-    keysToTry.push(active);
-    keysToTry.push(...geminiKeys.filter(k => k.id !== active.id));
-  } else {
-    keysToTry.push(...geminiKeys);
-  }
-  
-  // Try active key next if it is Groq
-  if (active && active.provider === 'Groq') {
-    keysToTry.push(active);
-    keysToTry.push(...groqKeys.filter(k => k.id !== active.id));
-  } else {
-    keysToTry.push(...groqKeys);
-  }
-  
-  // De-duplicate
-  const uniqueKeys: ApiKeyEntry[] = [];
-  const seenIds = new Set<string>();
-  for (const k of keysToTry) {
-    if (!seenIds.has(k.id)) {
-      seenIds.add(k.id);
-      uniqueKeys.push(k);
-    }
+  const serverResult = await response.json();
+  if (!serverResult || !serverResult.title || !Array.isArray(serverResult.keywords)) {
+    throw new Error("Invalid output received from server metadata engine.");
   }
 
-  if (uniqueKeys.length === 0) {
-    throw new Error("No valid API keys found. Please add at least one Gemini or Groq API key in Settings.");
-  }
-
-  let lastError: any = null;
-  
-  for (const keyEntry of uniqueKeys) {
-    try {
-      console.log(`Attempting generation with ${keyEntry.provider} key "${keyEntry.label}"...`);
-      if (keyEntry.provider === 'Gemini') {
-        return await callGemini(optimizedBase64, prompt, keyEntry.key, settings);
-      } else {
-        return await callGroq(optimizedBase64, prompt, keyEntry.key, settings);
-      }
-    } catch (err: any) {
-      console.warn(`${keyEntry.provider} key "${keyEntry.label}" failed:`, err);
-      lastError = err;
-    }
-  }
-
-  // If all keys in uniqueKeys failed, throw a readable combined error
-  const finalErrorMsg = lastError?.message || lastError || "Unknown error";
-  throw new Error(`All ${uniqueKeys.length} configured API keys failed. Last provider error: ${finalErrorMsg}`);
-}
-
-async function callGemini(base64Image: string, prompt: string, apiKey: string, settings: GenerationSettings) {
-  const ai = new GoogleGenAI({ apiKey });
-
-  const [header, data] = base64Image.split(',');
-  const mimeType = header.match(/:(.*?);/)?.[1] || 'image/jpeg';
-  
-  const supportedImageTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'];
-  const supportedVideoTypes = ['video/mp4', 'video/mpeg', 'video/mov', 'video/avi', 'video/flv', 'video/mpg', 'video/webm', 'video/wmv', 'video/3gp'];
-  const supportedDocTypes = ['application/pdf'];
-  
-  let finalMimeType = mimeType;
-  if (!supportedImageTypes.includes(mimeType) && !supportedVideoTypes.includes(mimeType) && !supportedDocTypes.includes(mimeType)) {
-    if (mimeType.includes('image')) {
-      finalMimeType = 'image/jpeg'; 
-    } else if (mimeType === 'application/postscript') {
-       throw new Error(`Gemini cannot read EPS/AI directly. To analyze this, please upload a JPG/PNG with the EXACT same filename as the EPS.`);
-    }
-  }
-
-  // Ultra-fast model list using official, state-of-the-art Gemini models
-  const candidateModels = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite", "gemini-3.1-pro-preview"];
-  let lastError: any = null;
-
-  for (const modelName of candidateModels) {
-    const maxRetries = 1; // 1 attempt per candidate for instantaneous fallback if throttled
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        console.log(`Analyzing image using model ${modelName} (Attempt ${attempt}/${maxRetries})...`);
-        const response = await ai.models.generateContent({
-          model: modelName,
-          contents: {
-            parts: [
-              { text: prompt },
-              {
-                inlineData: {
-                  data: data,
-                  mimeType: finalMimeType,
-                },
-              },
-            ],
-          },
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                title: {
-                  type: Type.STRING,
-                  description: `An SEO-driven stock title based on image content and platform rules. Target length is ${settings.titleLength} characters.`
-                },
-                description: {
-                  type: Type.STRING,
-                  description: "A clear, semantic description of the image content for stock search indexing."
-                },
-                keywords: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING },
-                  description: `A flat array of exactly ${settings.keywordCount} highly-relevant stock SEO keywords.`
-                }
-              },
-              required: ["title", "description", "keywords"]
-            }
-          },
-        });
-
-        const text = response.text;
-        if (!text) {
-          throw new Error("No response from Gemini");
-        }
-
-        return parseAndPolish(text, settings);
-      } catch (error: any) {
-        lastError = error;
-        const errMsg = String(error?.message || error || "").toUpperCase();
-        console.warn(`Attempt ${attempt} on model ${modelName} failed. Error:`, error);
-
-        // If it's a fatal key error, unauthorized/forbidden, invalid argument, or not found error, don't keep retrying this model
-        if (
-          errMsg.includes("APIKEY") || 
-          errMsg.includes("API_KEY") ||
-          errMsg.includes("INVALID_ARGUMENT") || 
-          errMsg.includes("NOT_FOUND") || 
-          errMsg.includes("NOT FOUND") || 
-          errMsg.includes("404") || 
-          errMsg.includes("403") || 
-          errMsg.includes("UNAUTHORIZED")
-        ) {
-          break;
-        }
-
-        // Exponential backoff
-        if (attempt < maxRetries) {
-          const delay = Math.pow(2, attempt) * 300;
-          await new Promise(resolve => setTimeout(resolve, delay));
-        }
-      }
-    }
-  }
-
-  // If we reach here, all candidate models failed
-  console.error("All Gemini candidate models failed. Last error details:", lastError);
-  const errorMsg = String(lastError?.message || lastError || "");
-  if (errorMsg.includes('503') || errorMsg.includes('UNAVAILABLE') || errorMsg.includes('high demand')) {
-    throw new Error("Gemini is experiencing extremely high demand at the moment. Please retry in a few seconds, or switch to Groq in Settings for instant results.");
-  }
-  if (errorMsg.includes('500') || errorMsg.includes('INTERNAL')) {
-    throw new Error("Gemini is currently experiencing a temporary internal error. Please try again in a few moments or switch to Groq in Settings.");
-  }
-  throw new Error(`Gemini API Error: ${lastError?.message || "Failed to generate metadata"}`);
+  return parseAndPolish(JSON.stringify(serverResult), settings);
 }
 
 async function callGroq(base64Image: string, prompt: string, apiKey: string, settings: GenerationSettings) {

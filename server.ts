@@ -326,24 +326,89 @@ async function startServer() {
     }
   });
 
-  // --- FAST AI METADATA GENERATION ENDPOINT ---
-  app.post("/api/generate-metadata", async (req, res) => {
-    try {
-      const { base64Image, settings, apiKey, assetType } = req.body;
-
-      const effectiveKey = apiKey || process.env.GEMINI_API_KEY;
-      if (!effectiveKey) {
-        return res.status(400).json({ error: "No API Key provided. Please add a Gemini or Groq key in Settings." });
+  // --- SHARED GEMINI CLIENT UTILITY ---
+  const defaultServerAi = new GoogleGenAI({
+    apiKey: process.env.GEMINI_API_KEY || "",
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
       }
+    }
+  });
 
-      const ai = new GoogleGenAI({
-        apiKey: effectiveKey,
+  function getAiClient(customKey?: string) {
+    if (customKey && customKey.trim()) {
+      return new GoogleGenAI({
+        apiKey: customKey.trim(),
         httpOptions: {
           headers: {
             'User-Agent': 'aistudio-build',
           }
         }
       });
+    }
+    return defaultServerAi;
+  }
+
+  // Gemini Service Health Status
+  app.get("/api/gemini/status", (req, res) => {
+    res.json({
+      configured: Boolean(process.env.GEMINI_API_KEY),
+      model: "gemini-3.8-flash"
+    });
+  });
+
+  // Helper to build high-converting stock SEO prompt
+  function buildSeoPrompt(settings: any, assetType: string = 'Photo'): string {
+    const platform = settings?.platform || 'Adobe Stock';
+    const titleLength = settings?.titleLength || '20-200';
+    const keywordCount = settings?.keywordCount || 30;
+
+    return `
+      You are a world-class Stock Content SEO Expert. 
+      Analyze the provided image and generate metadata optimized specifically for ${platform}.
+      
+      Asset Context:
+      - Target Platform: ${platform}
+      - Asset Type: ${assetType}
+      - Platform Rules: ${platform === 'Adobe Stock' ? 'Focus on commercial appeal, avoid numbers/camera info in title.' : ''}
+      ${platform === 'Shutterstock' ? 'Requires descriptive titles, keywords should be noun/adjective heavy.' : ''}
+      ${platform === 'Freepik' ? 'Highly descriptive, focus on use-case and design elements.' : ''}
+      ${platform === 'Getty Images' ? 'Editorial or commercial clarity, precise keywords.' : ''}
+      - Title Length: ${titleLength} characters.
+      - Keyword Count: Exactly ${keywordCount} keywords.
+      - PNG / Transparent Background Rule:
+        Check if the image has a transparent background (as is common with PNGs/vectors/graphics/isolated illustrations). If the background is transparent, describe it as "isolated on a transparent background", "transparent PNG", or "isolated graphic". Do NOT mention "white background" or "isolated on white" if the background is actually transparent. Only describe it as "white background" or "isolated on white" if there is a solid white background.
+      - Asset specific instruction: 
+        ${assetType === 'Vector' ? 'Focus on technical execution, usage as a design asset (SVG/EPS), and scalability. Mention "vector", "illustration", and specific design styles (flat, isometric, etc.).' : ''} 
+        ${assetType === 'Illustration' ? 'Focus on artistic style, mood, and digital/hand-drawn textures. Use descriptive adjectives (watercolor, charcoal, digital art).' : ''}
+        ${assetType === 'Video' ? 'Focus on motion, camera movement (pan, tilt, zoom), lighting, and the "story" captured in the clip. This is for stock footage SEO.' : ''}
+      - Keywords must be: SEO optimized, comma-separated, high-traffic terms, excluding stop words.
+      - Prefix: ${settings?.prefix || 'None'}
+      - Suffix: ${settings?.suffix || 'None'}
+      - Prohibited Terms (Exclude these): ${settings?.negativeKeywords || 'None'}
+
+      Output Requirements:
+      - Return ONLY a raw JSON object string.
+      - "title": A powerful, SEO-driven title based on image content and platform rules.
+      - "description": A clear, semantic description for search engine indexing.
+      - "keywords": A flat array of exactly ${keywordCount} strings.
+    `;
+  }
+
+  // --- FAST AI METADATA GENERATION ENDPOINT ---
+  app.post("/api/generate-metadata", async (req, res) => {
+    try {
+      const { base64Image, settings, apiKey, assetType } = req.body;
+
+      const effectiveKey = (apiKey && typeof apiKey === 'string' && apiKey.trim()) || process.env.GEMINI_API_KEY;
+      if (!effectiveKey) {
+        return res.status(500).json({ 
+          error: "Gemini API key is not configured on the server. Please attach an API key in Settings > Secrets." 
+        });
+      }
+
+      const ai = getAiClient(effectiveKey);
 
       const [header, data] = (base64Image || '').split(',');
       let mimeType = header?.match(/:(.*?);/)?.[1] || 'image/jpeg';
@@ -351,28 +416,10 @@ async function startServer() {
         mimeType = 'image/jpeg';
       }
 
-      const platform = settings?.platform || 'Adobe Stock';
-      const titleLength = settings?.titleLength || '20-200';
+      const prompt = buildSeoPrompt(settings, assetType || 'Photo');
       const keywordCount = settings?.keywordCount || 30;
 
-      const prompt = `
-        You are a world-class Stock Content SEO Expert. 
-        Analyze the provided image and generate metadata optimized specifically for ${platform}.
-        
-        Asset Context:
-        - Target Platform: ${platform}
-        - Asset Type: ${assetType || 'Photo'}
-        - Title Length: ${titleLength} characters.
-        - Keyword Count: Exactly ${keywordCount} keywords.
-        - Prefix: ${settings?.prefix || 'None'}
-        - Suffix: ${settings?.suffix || 'None'}
-        - Prohibited Terms: ${settings?.negativeKeywords || 'None'}
-
-        Output Requirements:
-        - Return ONLY a JSON object with "title", "description", and "keywords".
-      `;
-
-      // Try gemini-3.8-flash first for blazing-fast generation, then fallback if needed
+      // Ultra-fast model cascade using official Gemini Flash models
       const candidateModels = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"];
       let response: any = null;
       let lastErr: any = null;
@@ -427,10 +474,6 @@ async function startServer() {
       }
 
       const text = response.text;
-      if (!text) {
-        throw new Error("No response returned from Gemini API");
-      }
-
       const result = JSON.parse(text);
 
       // Apply title prefix/suffix if specified
@@ -441,10 +484,131 @@ async function startServer() {
         result.title = `${result.title} ${settings.suffix}`;
       }
 
+      // Ensure exact keyword count
+      if (result.keywords && Array.isArray(result.keywords) && keywordCount > 0) {
+        result.keywords = result.keywords.slice(0, keywordCount);
+      }
+
       res.json(result);
     } catch (err: any) {
       console.error("Server AI generation error:", err);
       res.status(500).json({ error: err.message || "AI metadata generation failed" });
+    }
+  });
+
+  // --- STREAMING METADATA GENERATION ENDPOINT (SSE) ---
+  app.post("/api/generate-metadata-stream", async (req, res) => {
+    try {
+      const { base64Image, settings, apiKey, assetType } = req.body;
+
+      const effectiveKey = (apiKey && typeof apiKey === 'string' && apiKey.trim()) || process.env.GEMINI_API_KEY;
+      if (!effectiveKey) {
+        return res.status(500).json({ 
+          error: "Gemini API key is not configured on the server. Please attach an API key in Settings > Secrets." 
+        });
+      }
+
+      const ai = getAiClient(effectiveKey);
+
+      const [header, data] = (base64Image || '').split(',');
+      let mimeType = header?.match(/:(.*?);/)?.[1] || 'image/jpeg';
+      if (!mimeType.startsWith('image/')) {
+        mimeType = 'image/jpeg';
+      }
+
+      const prompt = buildSeoPrompt(settings, assetType || 'Photo');
+
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+
+      const responseStream = await ai.models.generateContentStream({
+        model: "gemini-3.8-flash",
+        contents: {
+          parts: [
+            { text: prompt },
+            {
+              inlineData: {
+                data: data || '',
+                mimeType
+              }
+            }
+          ]
+        },
+        config: {
+          responseMimeType: "application/json"
+        }
+      });
+
+      for await (const chunk of responseStream) {
+        if (chunk.text) {
+          res.write(`data: ${JSON.stringify({ text: chunk.text })}\n\n`);
+        }
+      }
+
+      res.write("data: [DONE]\n\n");
+      res.end();
+    } catch (err: any) {
+      console.error("Server streaming generation error:", err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: err.message || "Streaming failed" });
+      } else {
+        res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+        res.end();
+      }
+    }
+  });
+
+  // --- GENERAL GEMINI SERVER PROXY ENDPOINTS ---
+  app.post("/api/gemini/generate", async (req, res) => {
+    try {
+      const { prompt, model = "gemini-3.8-flash", systemInstruction } = req.body;
+      const ai = defaultServerAi;
+
+      const response = await ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: systemInstruction ? { systemInstruction } : undefined
+      });
+
+      res.json({ text: response.text });
+    } catch (err: any) {
+      console.error("Gemini proxy error:", err);
+      res.status(500).json({ error: err.message || "Gemini generation failed" });
+    }
+  });
+
+  app.post("/api/gemini/generate-stream", async (req, res) => {
+    try {
+      const { prompt, model = "gemini-3.8-flash", systemInstruction } = req.body;
+      const ai = defaultServerAi;
+
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+
+      const responseStream = await ai.models.generateContentStream({
+        model,
+        contents: prompt,
+        config: systemInstruction ? { systemInstruction } : undefined
+      });
+
+      for await (const chunk of responseStream) {
+        if (chunk.text) {
+          res.write(`data: ${JSON.stringify({ text: chunk.text })}\n\n`);
+        }
+      }
+
+      res.write("data: [DONE]\n\n");
+      res.end();
+    } catch (err: any) {
+      console.error("Gemini stream proxy error:", err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: err.message || "Gemini streaming failed" });
+      } else {
+        res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+        res.end();
+      }
     }
   });
 

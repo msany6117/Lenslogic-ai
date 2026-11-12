@@ -18,6 +18,7 @@ export interface GenerationSettings {
   negativeKeywords: string;
   apiKeys: ApiKeyEntry[];
   activeKeyId: string | null;
+  batchSpeed?: 'safe' | 'turbo';
 }
 
 export interface ImageMetadata {

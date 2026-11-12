@@ -90,44 +90,44 @@ export default function AuthScreen({ onAuthSuccess }: AuthScreenProps) {
   };
 
   return (
-    <div className="min-h-screen bg-[#06040a] text-slate-100 flex flex-col items-center justify-center p-6 relative overflow-hidden">
-      {/* Background Blobs */}
-      <div className="absolute top-[-20%] left-[-20%] w-[60%] h-[60%] bg-indigo-600/10 blur-[150px] rounded-full pointer-events-none"></div>
-      <div className="absolute bottom-[-20%] right-[-20%] w-[60%] h-[60%] bg-purple-600/10 blur-[150px] rounded-full pointer-events-none"></div>
+    <div className="min-h-screen bg-[#f8fafc] text-slate-800 flex flex-col items-center justify-center p-6 relative overflow-hidden font-sans">
+      {/* Background Soft Ambient Lights */}
+      <div className="absolute top-[-15%] left-[-15%] w-[55%] h-[55%] bg-indigo-100/50 blur-[130px] rounded-full pointer-events-none"></div>
+      <div className="absolute bottom-[-15%] right-[-15%] w-[55%] h-[55%] bg-purple-100/40 blur-[130px] rounded-full pointer-events-none"></div>
 
       <div className="w-full max-w-md z-10">
         {/* Header/Logo */}
         <div className="flex flex-col items-center mb-8">
-          <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-indigo-500 to-indigo-700 flex items-center justify-center shadow-2xl shadow-indigo-500/30 ring-1 ring-white/20 mb-4 animate-bounce">
-            <ImageIcon className="text-white w-8 h-8" />
+          <div className="w-14 h-14 rounded-2xl bg-indigo-600 flex items-center justify-center shadow-lg shadow-indigo-500/25 ring-4 ring-indigo-50 mb-3.5 transition-transform hover:scale-105">
+            <ImageIcon className="text-white w-7 h-7" />
           </div>
-          <h1 className="text-3xl font-display font-bold tracking-tight text-white mb-2">
-            LensLogic <span className="bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">Studio</span>
+          <h1 className="text-2xl font-bold tracking-tight text-slate-900 mb-1">
+            LensLogic <span className="text-indigo-600">Studio</span>
           </h1>
-          <p className="text-slate-400 text-sm text-center">
-            Professional AI-Powered Metadata Generator for Stock Contributors
+          <p className="text-slate-500 text-xs text-center max-w-xs leading-relaxed">
+            AI-Powered Metadata Studio for Stock Image Contributors
           </p>
         </div>
 
         {/* Auth Card */}
-        <div className="glass rounded-2xl p-8 border border-white/10 shadow-2xl relative overflow-hidden bg-white/[0.02] backdrop-blur-xl">
-          <h2 className="text-xl font-bold mb-6 flex items-center gap-2">
-            {isSignUp ? <UserPlus className="w-5 h-5 text-indigo-400" /> : <LogIn className="w-5 h-5 text-indigo-400" />}
+        <div className="bg-white/95 rounded-3xl p-8 border border-slate-200/90 shadow-[0_10px_35px_rgba(0,0,0,0.04)] relative overflow-hidden backdrop-blur-xl">
+          <h2 className="text-lg font-bold text-slate-900 mb-5 flex items-center gap-2">
+            {isSignUp ? <UserPlus className="w-4 h-4 text-indigo-600" /> : <LogIn className="w-4 h-4 text-indigo-600" />}
             {isSignUp ? "Create Professional Account" : "Sign In to Studio"}
           </h2>
 
           {error && (
-            <div className="mb-6 p-4 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs flex items-start gap-2.5">
-              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+            <div className="mb-5 p-3.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs flex items-start gap-2.5">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-rose-500" />
               <span>{error}</span>
             </div>
           )}
 
           <form onSubmit={handleSubmit} className="space-y-4">
             <div>
-              <label className="block text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Email Address</label>
+              <label className="block text-[11px] font-bold text-slate-600 uppercase tracking-wider mb-1.5">Email Address</label>
               <div className="relative">
-                <span className="absolute inset-y-0 left-0 pl-3 flex items-center text-slate-500">
+                <span className="absolute inset-y-0 left-0 pl-3.5 flex items-center text-slate-400">
                   <Mail className="w-4 h-4" />
                 </span>
                 <input
@@ -136,15 +136,15 @@ export default function AuthScreen({ onAuthSuccess }: AuthScreenProps) {
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   placeholder="name@example.com"
-                  className="w-full pl-10 pr-4 py-3 bg-white/5 border border-white/10 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500/50 transition-all text-white placeholder-slate-500"
+                  className="w-full pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-600 focus:bg-white transition-all"
                 />
               </div>
             </div>
 
             <div>
-              <label className="block text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Password</label>
+              <label className="block text-[11px] font-bold text-slate-600 uppercase tracking-wider mb-1.5">Password</label>
               <div className="relative">
-                <span className="absolute inset-y-0 left-0 pl-3 flex items-center text-slate-500">
+                <span className="absolute inset-y-0 left-0 pl-3.5 flex items-center text-slate-400">
                   <Lock className="w-4 h-4" />
                 </span>
                 <input
@@ -153,7 +153,7 @@ export default function AuthScreen({ onAuthSuccess }: AuthScreenProps) {
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="••••••••"
-                  className="w-full pl-10 pr-4 py-3 bg-white/5 border border-white/10 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500/50 transition-all text-white placeholder-slate-500"
+                  className="w-full pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-600 focus:bg-white transition-all"
                 />
               </div>
             </div>
@@ -161,10 +161,10 @@ export default function AuthScreen({ onAuthSuccess }: AuthScreenProps) {
             <button
               type="submit"
               disabled={loading}
-              className="w-full py-3 px-4 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-xl text-sm font-bold transition-all shadow-lg shadow-indigo-600/30 flex items-center justify-center gap-2 cursor-pointer mt-6"
+              className="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-xl text-sm font-semibold transition-all shadow-sm hover:shadow flex items-center justify-center gap-2 cursor-pointer mt-5 active:scale-[0.99]"
             >
               {loading ? (
-                <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
+                <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
               ) : (
                 <>
                   {isSignUp ? "Create Free Account" : "Access Studio"}
@@ -175,23 +175,23 @@ export default function AuthScreen({ onAuthSuccess }: AuthScreenProps) {
           </form>
 
           <div className="relative flex py-4 items-center">
-            <div className="flex-grow border-t border-white/5"></div>
-            <span className="flex-shrink mx-4 text-[10px] text-slate-500 font-bold uppercase tracking-widest">or</span>
-            <div className="flex-grow border-t border-white/5"></div>
+            <div className="flex-grow border-t border-slate-100"></div>
+            <span className="flex-shrink mx-3 text-[10px] text-slate-400 font-bold uppercase tracking-widest">or</span>
+            <div className="flex-grow border-t border-slate-100"></div>
           </div>
 
           <button
             onClick={handleGuestMode}
             disabled={loading}
-            className="w-full py-3 px-4 bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 rounded-xl text-sm font-semibold transition-all flex items-center justify-center gap-2 cursor-pointer"
+            className="w-full py-2.5 px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200/80 rounded-xl text-sm font-semibold transition-all flex items-center justify-center gap-2 cursor-pointer active:scale-[0.99]"
           >
             Explore as Guest
           </button>
 
-          <div className="mt-6 text-center">
+          <div className="mt-5 text-center">
             <button
               onClick={() => setIsSignUp(!isSignUp)}
-              className="text-xs text-indigo-400 hover:text-indigo-300 font-medium cursor-pointer"
+              className="text-xs text-indigo-600 hover:text-indigo-700 font-medium cursor-pointer"
             >
               {isSignUp ? "Already have an account? Sign In" : "Don't have an account? Create one"}
             </button>
@@ -199,28 +199,28 @@ export default function AuthScreen({ onAuthSuccess }: AuthScreenProps) {
         </div>
 
         {/* Demo Admin Account Tip */}
-        <div className="mt-4 p-4 rounded-xl bg-indigo-950/20 border border-indigo-500/10 text-center">
-          <p className="text-xs text-slate-400">
-            💡 <strong className="text-indigo-300">Admin Account:</strong> Access directly using <span className="font-mono text-indigo-200">msany6117@gmail.com</span> and password <span className="font-mono text-indigo-200">Admin@124390</span>.
+        <div className="mt-4 p-3.5 rounded-2xl bg-indigo-50/70 border border-indigo-100 text-center">
+          <p className="text-xs text-slate-600">
+            💡 <strong className="text-indigo-900">Admin Account:</strong> Access using <span className="font-mono text-indigo-700 font-medium">msany6117@gmail.com</span> / <span className="font-mono text-indigo-700 font-medium">Admin@124390</span>
           </p>
         </div>
 
         {/* Backend Connection Settings */}
-        <div className="mt-4 p-4 rounded-xl bg-white/[0.02] border border-white/5 text-center">
+        <div className="mt-3.5 p-3.5 rounded-2xl bg-white border border-slate-200/80 text-center shadow-xs">
           <details className="group">
-            <summary className="text-xs font-semibold text-slate-400 hover:text-slate-300 cursor-pointer list-none flex items-center justify-center gap-1.5 select-none">
+            <summary className="text-xs font-medium text-slate-600 hover:text-slate-800 cursor-pointer list-none flex items-center justify-center gap-1.5 select-none">
               <span>🔧 Connection Settings (Vercel / Custom Domain)</span>
               <span className="transition-transform group-open:rotate-180 text-[10px]">▼</span>
             </summary>
-            <div className="mt-3 text-left space-y-2.5 pt-2 border-t border-white/5">
-              <p className="text-[11px] text-slate-400 leading-relaxed">
-                If hosted on Vercel or a custom domain, specify your Cloud Run Express backend server URL:
+            <div className="mt-3 text-left space-y-2 pt-2 border-t border-slate-100">
+              <p className="text-[11px] text-slate-500 leading-relaxed">
+                If hosted on Vercel or custom domain, specify your backend API URL:
               </p>
               <div>
-                <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1.5">Backend API Base URL</label>
+                <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1">Backend API Base URL</label>
                 <input
                   type="text"
-                  placeholder="https://your-backend-cloud-run-url.run.app"
+                  placeholder="https://your-backend.run.app"
                   value={apiUrlInput}
                   onChange={(e) => {
                     const val = e.target.value;
@@ -231,11 +231,11 @@ export default function AuthScreen({ onAuthSuccess }: AuthScreenProps) {
                       localStorage.removeItem("LENS_LOGIC_API_URL");
                     }
                   }}
-                  className="w-full px-3 py-1.5 bg-white/5 border border-white/10 rounded-lg text-xs focus:outline-none focus:border-indigo-500/50 text-white font-mono"
+                  className="w-full px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs focus:outline-none focus:border-indigo-500 text-slate-800 font-mono"
                 />
               </div>
-              <p className="text-[9px] text-slate-500 italic font-mono">
-                Currently targeting: {localStorage.getItem("LENS_LOGIC_API_URL") || (typeof process !== "undefined" && process.env?.APP_URL) || "Relative Paths (Default)"}
+              <p className="text-[9px] text-slate-400 italic font-mono">
+                Targeting: {localStorage.getItem("LENS_LOGIC_API_URL") || "Relative Paths (Default)"}
               </p>
             </div>
           </details>
