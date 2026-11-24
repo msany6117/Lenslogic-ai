@@ -60,6 +60,10 @@ export async function verifyAuthSession(): Promise<any | null> {
     const res = await fetch(getApiUrl("/api/auth/me"), {
       headers: getAuthHeaders()
     });
+    if (res.status === 401) {
+      setAuthToken(null);
+      return null;
+    }
     if (!res.ok) return null;
     const data = await res.json();
     if (data?.user) {
@@ -75,8 +79,23 @@ export async function verifyAuthSession(): Promise<any | null> {
 // Helper to determine the backend API base URL
 export function getApiUrl(path: string): string {
   try {
-    const localUrl = localStorage.getItem("LENS_LOGIC_API_URL");
+    const localUrl = localStorage.getItem("LENS_LOGIC_API_URL")?.trim();
     if (localUrl && (localUrl.startsWith("http://") || localUrl.startsWith("https://"))) {
+      // Ignore stale AI Studio preview URLs that differ from the active origin to avoid cross-origin Failed to fetch
+      if (typeof window !== "undefined") {
+        try {
+          const parsed = new URL(localUrl);
+          if (
+            parsed.origin !== window.location.origin &&
+            (parsed.hostname.includes(".run.app") || parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1")
+          ) {
+            localStorage.removeItem("LENS_LOGIC_API_URL");
+            return path;
+          }
+        } catch {
+          return path;
+        }
+      }
       return `${localUrl.replace(/\/$/, "")}${path}`;
     }
     const envUrl = (import.meta as any).env?.VITE_API_URL;
@@ -106,11 +125,46 @@ export async function saveUserProfile(uid: string, email: string, data?: Partial
     payload.role = data.role;
   }
 
-  const res = await fetch(getApiUrl("/api/users/update"), {
-    method: "POST",
-    headers: getAuthHeaders({ "Content-Type": "application/json" }),
-    body: JSON.stringify(payload)
-  });
+  const postUpdate = () =>
+    fetch(getApiUrl("/api/users/update"), {
+      method: "POST",
+      headers: getAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload)
+    });
+
+  let res: Response;
+  try {
+    res = await postUpdate();
+  } catch {
+    // Offline or cross-origin unreachable; settings remain persisted in localStorage
+    return;
+  }
+
+  if (res.status === 401) {
+    const isGuest = uid.startsWith("guest_") || email === "guest@lenslogic.ai";
+    setAuthToken(null);
+    if (isGuest) {
+      try {
+        await ensureGuestSession(uid);
+        if (getAuthToken()) {
+          res = await postUpdate();
+        } else {
+          return;
+        }
+      } catch {
+        return;
+      }
+    } else {
+      return;
+    }
+  }
+
+  // On serverless deployments (e.g. Vercel without DB persistence), 404/405/HTML is expected; keep localStorage state
+  const contentType = (res.headers.get("content-type") || "").toLowerCase();
+  if (res.status === 404 || res.status === 405 || contentType.includes("text/html")) {
+    return;
+  }
+
   if (!res.ok) {
     const errBody = await res.json().catch(() => ({}));
     throw new Error(errBody?.error || "Failed to update profile settings.");

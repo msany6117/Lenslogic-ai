@@ -30,7 +30,7 @@ import { generateMetadata as generateMetadataService } from './services/aiServic
 import { loadVectorPreview } from './services/vectorService';
 import type { GenerationSettings, ImageMetadata, AssetType } from './types';
 
-import { saveUserProfile, getApiUrl } from './services/dbService';
+import { saveUserProfile, getApiUrl, ensureGuestSession, getAuthToken, verifyAuthSession, setAuthToken } from './services/dbService';
 import AuthScreen from './components/AuthScreen';
 import AdminPanel from './components/AdminPanel';
 import FreepikConverter from './components/FreepikConverter';
@@ -95,35 +95,59 @@ export default function App() {
   // Check auth state on mount and sync assets
   React.useEffect(() => {
     const initAuth = async () => {
-      let savedUser = localStorage.getItem('lenslogic_user');
-      if (!savedUser) {
-        // Auto-initialize premium persistent guest session to bypass account setup
+      let currentUser: any = null;
+      const savedUser = localStorage.getItem('lenslogic_user');
+      if (savedUser) {
+        try {
+          currentUser = JSON.parse(savedUser);
+        } catch (e) {
+          console.error("Error restoring session:", e);
+        }
+      }
+
+      if (!currentUser) {
+        // Auto-initialize persistent guest session immediately so UI renders without blocking
         const guestUid = 'guest_' + Math.random().toString(36).substring(2, 11);
-        const guestUser = {
+        currentUser = {
           uid: guestUid,
           email: 'guest@lenslogic.ai',
           role: 'user',
           savedSettings: null,
           createdAt: new Date().toISOString()
         };
-        localStorage.setItem('lenslogic_user', JSON.stringify(guestUser));
-        savedUser = JSON.stringify(guestUser);
+        localStorage.setItem('lenslogic_user', JSON.stringify(currentUser));
       }
 
-      if (savedUser) {
-        try {
-          const currentUser = JSON.parse(savedUser);
-          setUser(currentUser);
-          setUserProfile(currentUser);
-          
-          if (currentUser.savedSettings) {
-            setSettings(normalizeSettings(currentUser.savedSettings));
-          }
-        } catch (e) {
-          console.error("Error restoring session:", e);
-        }
+      setUser(currentUser);
+      setUserProfile(currentUser);
+      if (currentUser.savedSettings) {
+        setSettings(normalizeSettings(currentUser.savedSettings));
       }
       setLoadingAuth(false);
+
+      // Verify existing backend session token or mint a fresh guest session token asynchronously
+      try {
+        const existingToken = getAuthToken();
+        if (existingToken) {
+          const verified = await verifyAuthSession();
+          if (verified) {
+            setUser(verified);
+            setUserProfile(verified);
+            return;
+          }
+          setAuthToken(null);
+        }
+        const isGuest = !currentUser.uid || String(currentUser.uid).startsWith('guest_') || currentUser.email === 'guest@lenslogic.ai';
+        if (isGuest) {
+          const guestUser = await ensureGuestSession(currentUser.uid);
+          if (guestUser) {
+            setUser((prev: any) => ({ ...guestUser, savedSettings: prev?.savedSettings ?? guestUser.savedSettings }));
+            setUserProfile(guestUser);
+          }
+        }
+      } catch {
+        // Offline / serverless fallback uses localStorage cleanly
+      }
     };
     initAuth();
   }, []);
@@ -155,7 +179,9 @@ export default function App() {
         savedApiKey: geminiKey,
         savedGroqKey: groqKey,
         savedSettings: settings
-      }).catch(err => console.error("Error saving profile settings:", err));
+      }).catch(() => {
+        // Settings remain safely stored in localStorage
+      });
     }, 600);
 
     return () => clearTimeout(timer);
@@ -167,6 +193,7 @@ export default function App() {
 
   const confirmResetSession = () => {
     localStorage.removeItem('lenslogic_user');
+    setAuthToken(null);
     setImages([]);
     setActiveTab('metadata');
     const guestUid = 'guest_' + Math.random().toString(36).substring(2, 11);
@@ -181,6 +208,7 @@ export default function App() {
     setUser(guestUser);
     setUserProfile(guestUser);
     setShowResetConfirm(false);
+    ensureGuestSession(guestUid).catch(() => {});
   };
 
   // File Upload Handling
@@ -410,7 +438,10 @@ export default function App() {
   } as any);
 
   // Metadata Generation Logic
-  const generateMetadata = async (image: ImageMetadata): Promise<{ rateLimited?: boolean }> => {
+  const generateMetadata = async (
+    image: ImageMetadata,
+    overrideKey?: GenerationSettings['apiKeys'][number] | null
+  ): Promise<{ rateLimited?: boolean }> => {
     if (!image.preview && (image.type === 'Vector' || image.type === 'Video')) {
       const updatedImg = { 
         ...image, 
@@ -427,7 +458,10 @@ export default function App() {
 
     try {
       const currentSettings = settingsRef.current;
-      const activeKey = (currentSettings.apiKeys || []).find(k => k.id === currentSettings.activeKeyId) || null;
+      const activeKey =
+        overrideKey ||
+        (currentSettings.apiKeys || []).find(k => k.id === currentSettings.activeKeyId) ||
+        null;
 
       let base64 = '';
       if (image.preview) {
@@ -444,25 +478,34 @@ export default function App() {
       const fileExt = (image.fileName || image.file?.name || '').split('.').pop()?.toLowerCase() || '';
 
       let data;
-      try {
-        data = await generateMetadataService(base64, currentSettings, activeKey, image.type, fileExt);
-      } catch (err: any) {
-        const msg = String(err?.message || '').toLowerCase();
-        const isTransient =
-          msg.includes('429') ||
-          msg.includes('quota') ||
-          msg.includes('rate') ||
-          msg.includes('503') ||
-          msg.includes('high demand') ||
-          msg.includes('busy') ||
-          msg.includes('unavailable') ||
-          msg.includes('html') ||
-          msg.includes('non-json') ||
-          msg.includes('failed to fetch');
-        if (isTransient) {
-          await new Promise(r => setTimeout(r, 1000));
+      const backoffDelaysMs = [1500, 3000, 5000];
+      for (let attempt = 0; attempt <= backoffDelaysMs.length; attempt++) {
+        try {
           data = await generateMetadataService(base64, currentSettings, activeKey, image.type, fileExt);
-        } else {
+          break;
+        } catch (err: any) {
+          const msg = String(err?.message || '').toLowerCase();
+          const isTransient =
+            msg.includes('429') ||
+            msg.includes('quota') ||
+            msg.includes('rate') ||
+            msg.includes('503') ||
+            msg.includes('high demand') ||
+            msg.includes('busy') ||
+            msg.includes('unavailable') ||
+            msg.includes('timed out') ||
+            msg.includes('html') ||
+            msg.includes('non-json') ||
+            msg.includes('failed to fetch') ||
+            msg.includes('reach the metadata server');
+          if (isTransient && attempt < backoffDelaysMs.length) {
+            const retrySecMatch = msg.match(/retry\s+in\s+(\d+)\s*s/i);
+            const hintedMs = retrySecMatch ? Math.min(6500, Number(retrySecMatch[1]) * 1000) : 0;
+            const waitMs = Math.max(backoffDelaysMs[attempt], hintedMs);
+            const jitter = Math.floor(Math.random() * 500);
+            await new Promise(r => setTimeout(r, waitMs + jitter));
+            continue;
+          }
           throw err;
         }
       }
@@ -474,9 +517,11 @@ export default function App() {
       } : img));
       return {};
     } catch (error) {
-      console.error('Generation Error:', error);
       const errorMsg = error instanceof Error ? error.message : 'Generation failed';
       const isRateLimited = /429|quota|rate|503|high demand|busy|unavailable/i.test(errorMsg);
+      if (!isRateLimited) {
+        console.error('Generation Error:', error);
+      }
       setImages(prev => prev.map(img => img.id === image.id ? {
         ...img,
         status: 'error' as const,
@@ -499,22 +544,25 @@ export default function App() {
       setIsProcessingAll(false);
       return;
     }
-    
-    // Safe Mode uses balanced concurrency to stay fast while avoiding 429 bursts on free-tier Gemini keys
+
+    const validKeys = (settingsRef.current.apiKeys || []).filter(k => Boolean(k?.key?.trim()));
     const isSafe = settingsRef.current.batchSpeed !== 'turbo';
-    const CONCURRENCY = isSafe ? 3 : 6;
-    const DELAY_MS = isSafe ? 120 : 40;
-    
+    const CONCURRENCY = isSafe ? Math.max(2, Math.min(4, validKeys.length * 2 || 2)) : Math.max(4, Math.min(8, validKeys.length * 3 || 4));
+    const DELAY_MS = isSafe ? 350 : 100;
+
     let completedCount = 0;
+    let keyCursor = 0;
+    const requeueCounts = new Map<string, number>();
+
     setBatchProgress({
       total: pending.length,
       completed: 0,
       currentName: pending[0]?.fileName || pending[0]?.file?.name || 'Asset',
       isRateLimited: false
     });
-    
+
     const queue = [...pending];
-    
+
     const worker = async () => {
       while (queue.length > 0) {
         const img = queue.shift();
@@ -522,10 +570,24 @@ export default function App() {
         const assetName = img.fileName || img.file?.name || 'Asset';
         setBatchProgress(p => p ? { ...p, currentName: assetName } : null);
 
-        const outcome = await generateMetadata(img);
+        // Rotate across all configured user keys automatically for higher throughput
+        const preferredKey = validKeys.length > 0 ? validKeys[keyCursor++ % validKeys.length] : null;
+        const outcome = await generateMetadata(img, preferredKey);
+
+        const prevRequeues = requeueCounts.get(img.id) || 0;
+        if (outcome.rateLimited && prevRequeues < 2) {
+          requeueCounts.set(img.id, prevRequeues + 1);
+          setImages(prev => prev.map(item => item.id === img.id ? { ...item, status: 'idle', error: undefined } : item));
+          queue.push(img);
+          setBatchProgress(p => p ? { ...p, isRateLimited: true } : null);
+          await new Promise(r => setTimeout(r, 3500 + prevRequeues * 1500));
+          setBatchProgress(p => p ? { ...p, isRateLimited: false } : null);
+          continue;
+        }
+
         if (outcome.rateLimited) {
           setBatchProgress(p => p ? { ...p, isRateLimited: true } : null);
-          await new Promise(r => setTimeout(r, 1500));
+          await new Promise(r => setTimeout(r, 3000));
           setBatchProgress(p => p ? { ...p, isRateLimited: false } : null);
         }
 
@@ -887,19 +949,19 @@ export default function App() {
               </div>
             )}
 
-              {/* Safe Mode Rate Limit Badge in Sidebar */}
+              {/* Smart Batch Engine Badge in Sidebar */}
               <div className="p-3 bg-slate-50 border border-slate-200/70 rounded-xl">
                 <div className="flex items-center justify-between mb-1.5">
                   <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-700">
                     <Sparkles className="w-3.5 h-3.5 text-indigo-600" />
-                    <span>Free-Tier Shield</span>
+                    <span>Unlimited Key Engine</span>
                   </div>
                   <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200">
                     Active
                   </span>
                 </div>
                 <p className="text-[10px] text-slate-500 leading-relaxed">
-                  Automatic quota protection prevents 429 errors & Pro quota limits on free Gemini keys.
+                  No app limits. Runs on your own API keys with automatic multi-key rotation &amp; retry recovery.
                 </p>
               </div>
             </div>
@@ -1217,7 +1279,7 @@ export default function App() {
                     <div className="flex items-center justify-between">
                       <header>
                         <label className="text-[11px] font-bold text-slate-400 uppercase tracking-widest">API Keys</label>
-                        <p className="text-xs text-slate-500 mt-0.5">Google Gemini API keys (Free tier protected)</p>
+                        <p className="text-xs text-slate-500 mt-0.5">Gemini &amp; Groq API keys (Unlimited — your own keys, zero app limits)</p>
                       </header>
                       <button 
                         onClick={() => {
@@ -1360,7 +1422,7 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Batch Speed & Free Tier Rate Limiting */}
+                  {/* Batch Processing Mode */}
                   <div className="space-y-3 pt-4 border-t border-slate-100">
                     <label className="text-[11px] font-bold text-slate-400 uppercase tracking-widest block">
                       Batch Processing Mode
@@ -1381,7 +1443,7 @@ export default function App() {
                           {(settings.batchSpeed || 'safe') === 'safe' && <Check className="w-3.5 h-3.5 text-indigo-600" />}
                         </div>
                         <p className="text-[10px] text-slate-500 leading-tight">
-                          Prevents 429 Quota Exceeded errors on Free-Tier Gemini keys (15 RPM compliant).
+                          Balanced concurrency with automatic retry &amp; queue recovery to minimize upstream API bursts.
                         </p>
                       </button>
 
@@ -1400,7 +1462,7 @@ export default function App() {
                           {settings.batchSpeed === 'turbo' && <Check className="w-3.5 h-3.5 text-indigo-600" />}
                         </div>
                         <p className="text-[10px] text-slate-500 leading-tight">
-                          Higher parallelism for paid Google Cloud tier with high rate limits.
+                          Maximum parallel speed across your configured API keys.
                         </p>
                       </button>
                     </div>

@@ -3,11 +3,7 @@ import {
   applyCors,
   buildSeoPrompt,
   extractCleanUpstreamError,
-  fingerprintKey,
   getAiClient,
-  modelQuotaCooldown,
-  modelTransientCooldown,
-  recordModelCooldownIfDailyQuota,
   safeParseJsonObject,
   sanitizeTransparentAndFormat,
 } from "./_geminiShared.js";
@@ -18,7 +14,6 @@ export default async function handler(req: any, res: any) {
     return res.status(405).json({ error: "Method not allowed. Use POST." });
   }
 
-  let hadDailyQuota429 = false;
   let primaryModelErr: any = null;
 
   try {
@@ -69,46 +64,34 @@ export default async function handler(req: any, res: any) {
     }
 
     const ai = getAiClient(customKey);
-    const keyFingerprint = fingerprintKey(customKey);
     const prompt = buildSeoPrompt(settings || {}, assetType || "Photo", fileExtension);
     const keywordCount = Number(settings?.keywordCount) || 30;
 
-    const baseSchedule: Array<{
+    const attemptSchedule: Array<{
       model: string;
       thinkingLevel?: ThinkingLevel;
       delayBeforeMs: number;
       timeoutMs: number;
     }> = [
       { model: "gemini-4-hydrogen", thinkingLevel: ThinkingLevel.LOW, delayBeforeMs: 0, timeoutMs: 8000 },
-      { model: "gemini-3.1-flash-lite", delayBeforeMs: 0, timeoutMs: 16000 },
-      { model: "gemini-3.1-flash-lite", delayBeforeMs: 400, timeoutMs: 20000 },
+      { model: "gemini-3.1-flash-lite", delayBeforeMs: 0, timeoutMs: 11000 },
+      { model: "gemini-4-hydrogen", thinkingLevel: ThinkingLevel.LOW, delayBeforeMs: 1100, timeoutMs: 11000 },
+      { model: "gemini-3.1-flash-lite", delayBeforeMs: 1800, timeoutMs: 12000 },
     ];
-
-    const now = Date.now();
-    const primaryCooldownUntil = modelQuotaCooldown.get(`${keyFingerprint}:gemini-4-hydrogen`) || 0;
-    hadDailyQuota429 = now < primaryCooldownUntil;
-
-    let attemptSchedule = baseSchedule.filter((cfg) => {
-      const quotaUntil = modelQuotaCooldown.get(`${keyFingerprint}:${cfg.model}`) || 0;
-      const transientUntil = modelTransientCooldown.get(`${keyFingerprint}:${cfg.model}`) || 0;
-      return now >= quotaUntil && now >= transientUntil;
-    });
-    if (attemptSchedule.length === 0) {
-      attemptSchedule = [
-        { model: "gemini-3.1-flash-lite", delayBeforeMs: 0, timeoutMs: 18000 },
-        { model: "gemini-4-hydrogen", thinkingLevel: ThinkingLevel.LOW, delayBeforeMs: 500, timeoutMs: 20000 },
-      ];
-    }
 
     let response: any = null;
     let lastErr: any = null;
-    let prevModel: string | null = null;
+    let skipPrimaryForRequest = false;
 
-    for (const cfg of attemptSchedule) {
-      const sameModelRetry = prevModel === cfg.model;
-      prevModel = cfg.model;
-      if (sameModelRetry && cfg.delayBeforeMs > 0) {
-        const jitter = Math.floor(Math.random() * 150);
+    for (let idx = 0; idx < attemptSchedule.length; idx++) {
+      const baseCfg = attemptSchedule[idx];
+      const cfg =
+        skipPrimaryForRequest && baseCfg.model === "gemini-4-hydrogen"
+          ? { ...baseCfg, model: "gemini-3.1-flash-lite", thinkingLevel: undefined }
+          : baseCfg;
+
+      if (idx > 0 && cfg.delayBeforeMs > 0) {
+        const jitter = Math.floor(Math.random() * 350);
         await new Promise((resolve) => setTimeout(resolve, cfg.delayBeforeMs + jitter));
       }
       try {
@@ -151,7 +134,6 @@ export default async function handler(req: any, res: any) {
           },
         });
         if (response?.text) {
-          modelTransientCooldown.delete(`${keyFingerprint}:${cfg.model}`);
           break;
         }
       } catch (e: any) {
@@ -167,16 +149,11 @@ export default async function handler(req: any, res: any) {
         ) {
           primaryModelErr = e;
         }
-        if (recordModelCooldownIfDailyQuota(keyFingerprint, cfg.model, rawMsg)) {
-          hadDailyQuota429 = true;
-        } else if (
-          upper.includes("503") ||
-          upper.includes("UNAVAILABLE") ||
-          upper.includes("HIGH DEMAND") ||
-          upper.includes("ABORT") ||
-          upper.includes("TIMEOUT")
+        if (
+          cfg.model === "gemini-4-hydrogen" &&
+          (/GenerateRequestsPerDay|limit:\s*0\b/i.test(rawMsg) || upper.includes("429"))
         ) {
-          modelTransientCooldown.set(`${keyFingerprint}:${cfg.model}`, Date.now() + 90 * 1000);
+          skipPrimaryForRequest = true;
         }
 
         if (
@@ -206,12 +183,8 @@ export default async function handler(req: any, res: any) {
     return res.status(200).json(result);
   } catch (err: any) {
     const raw = String(err?.message || "");
-    let cleanMsg = extractCleanUpstreamError(err, "AI metadata generation failed");
+    const cleanMsg = extractCleanUpstreamError(err, "AI metadata generation failed");
     const isBusy503 = raw.includes("503") || raw.includes("UNAVAILABLE") || raw.includes("high demand");
-    if (isBusy503 && hadDailyQuota429) {
-      cleanMsg =
-        "Your Gemini API key has reached its free-tier daily quota (429) and the fallback model is temporarily busy (503). Please try another key or Groq key in AI Configuration.";
-    }
     const isQuota429 = raw.includes("429") || raw.includes("RESOURCE_EXHAUSTED");
     const isAuth403 =
       raw.includes("API_KEY_INVALID") || raw.includes("PERMISSION_DENIED") || raw.includes("403");

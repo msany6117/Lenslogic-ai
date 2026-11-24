@@ -2,11 +2,7 @@ import { ThinkingLevel, Type } from "@google/genai";
 import {
   applyCors,
   extractCleanUpstreamError,
-  fingerprintKey,
   getAiClient,
-  modelQuotaCooldown,
-  modelTransientCooldown,
-  recordModelCooldownIfDailyQuota,
   safeParseJsonObject,
 } from "../_geminiShared.js";
 
@@ -215,22 +211,11 @@ ${Array.isArray(recentConcepts) && recentConcepts.length > 0 ? `- Avoid repeatin
       },
     ];
 
-    const keyFingerprint = fingerprintKey(customKey);
-    const now = Date.now();
-    let activeCandidates = candidateConfigs.filter((cfg) => {
-      const quotaUntil = modelQuotaCooldown.get(`${keyFingerprint}:${cfg.model}`) || 0;
-      const transientUntil = modelTransientCooldown.get(`${keyFingerprint}:${cfg.model}`) || 0;
-      return now >= quotaUntil && now >= transientUntil;
-    });
-    if (activeCandidates.length === 0) {
-      activeCandidates = [candidateConfigs[candidateConfigs.length - 1], candidateConfigs[0]];
-    }
-
     let blueprints: any[] = [];
     let lastErr: any = null;
     const maxTokens = safeCount === 1 ? 4608 : 10240;
 
-    for (const cfg of activeCandidates) {
+    for (const cfg of candidateConfigs) {
       try {
         const response = await ai.models.generateContent({
           model: cfg.model,
@@ -263,24 +248,11 @@ ${Array.isArray(recentConcepts) && recentConcepts.length > 0 ? `- Avoid repeatin
         if (list.length === 0) {
           throw new Error(`Model ${cfg.model} returned an empty blueprint list.`);
         }
-        modelTransientCooldown.delete(`${keyFingerprint}:${cfg.model}`);
         blueprints = list;
         break;
       } catch (err: any) {
         lastErr = err;
-        const rawMsg = String(err?.message || err || "");
-        const msg = rawMsg.toUpperCase();
-        if (!recordModelCooldownIfDailyQuota(keyFingerprint, cfg.model, rawMsg)) {
-          if (
-            msg.includes("503") ||
-            msg.includes("UNAVAILABLE") ||
-            msg.includes("HIGH DEMAND") ||
-            msg.includes("ABORT") ||
-            msg.includes("TIMEOUT")
-          ) {
-            modelTransientCooldown.set(`${keyFingerprint}:${cfg.model}`, Date.now() + 90 * 1000);
-          }
-        }
+        const msg = String(err?.message || err || "").toUpperCase();
         if (msg.includes("API_KEY") || msg.includes("PERMISSION_DENIED") || msg.includes("403")) {
           break;
         }

@@ -1,8 +1,4 @@
-import crypto from "crypto";
 import { GoogleGenAI } from "@google/genai";
-
-export const modelQuotaCooldown = new Map<string, number>();
-export const modelTransientCooldown = new Map<string, number>();
 
 export function getAiClient(customKey?: string) {
   const trimmed = typeof customKey === "string" ? customKey.trim() : "";
@@ -14,10 +10,6 @@ export function getAiClient(customKey?: string) {
       },
     },
   });
-}
-
-export function fingerprintKey(key: string): string {
-  return crypto.createHash("sha256").update(key).digest("hex").slice(0, 12);
 }
 
 export function safeParseJsonObject(rawText: string): any {
@@ -40,21 +32,6 @@ export function safeParseJsonObject(rawText: string): any {
   }
 }
 
-export function recordModelCooldownIfDailyQuota(
-  keyFingerprint: string,
-  model: string,
-  rawMsg: string
-): boolean {
-  const isDailyQuota =
-    /GenerateRequestsPerDay|PerDay|limit:\s*0\b/i.test(rawMsg) ||
-    (rawMsg.includes("429") && /requests per day/i.test(rawMsg));
-  if (isDailyQuota) {
-    modelQuotaCooldown.set(`${keyFingerprint}:${model}`, Date.now() + 5 * 60 * 1000);
-    return true;
-  }
-  return false;
-}
-
 export function extractCleanUpstreamError(err: any, fallbackMsg: string): string {
   let raw = String(err?.message || fallbackMsg || "").trim();
   if (raw.startsWith("{") || raw.includes('"error"')) {
@@ -73,11 +50,10 @@ export function extractCleanUpstreamError(err: any, fallbackMsg: string): string
   if (raw.includes("API_KEY_INVALID") || raw.includes("API key not valid")) {
     return "Gemini API key is invalid or unauthorized. Please check your key in AI Configuration.";
   }
-  if (/GenerateRequestsPerDay|requests per day/i.test(raw)) {
-    return "Free-tier daily Gemini quota reached (429). Add your own Gemini or Groq key in AI Configuration, or retry after quota reset.";
-  }
   if (raw.includes("429") || raw.includes("RESOURCE_EXHAUSTED") || raw.includes("quota")) {
-    return "Gemini API rate/quota limit reached (429). Please wait a moment and retry.";
+    const retryMatch = raw.match(/retry\s+in\s+([\d.]+)s/i);
+    const retryHint = retryMatch ? ` (retry in ${Math.ceil(Number(retryMatch[1]))}s)` : "";
+    return `Google Gemini API rate limit reached on your API key${retryHint}. Please wait a moment or add an additional key in AI Configuration.`;
   }
   if (
     raw.includes("Unterminated string") ||

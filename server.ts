@@ -677,8 +677,6 @@ async function startServer() {
 
   // --- FAST AI METADATA GENERATION ENDPOINT ---
   app.post("/api/generate-metadata", async (req, res) => {
-    let hadDailyQuota429 = false;
-    let primaryModelErr: any = null;
     try {
       const { base64Image, settings, apiKey, assetType, fileExtension } = req.body || {};
 
@@ -720,42 +718,31 @@ async function startServer() {
       }
 
       const ai = getAiClient(customKey);
-      const keyFingerprint = crypto.createHash('sha256').update(customKey).digest('hex').slice(0, 12);
       const prompt = buildSeoPrompt(settings || {}, assetType || 'Photo', fileExtension);
       const keywordCount = Number(settings?.keywordCount) || 30;
 
-      // Official fast Gemini models: try fast LOW-thinking Hydrogen first (8s cap), then ultra-fast Flash-Lite (0ms switch) within nginx timeouts
-      const baseSchedule: Array<{ model: string; thinkingLevel?: ThinkingLevel; delayBeforeMs: number; timeoutMs: number }> = [
+      // Always try the user's key with zero persistent lockouts: Hydrogen -> Flash-Lite -> exponential backoff retries
+      const attemptSchedule: Array<{ model: string; thinkingLevel?: ThinkingLevel; delayBeforeMs: number; timeoutMs: number }> = [
         { model: "gemini-4-hydrogen", thinkingLevel: ThinkingLevel.LOW, delayBeforeMs: 0, timeoutMs: 8000 },
-        { model: "gemini-3.1-flash-lite", delayBeforeMs: 0, timeoutMs: 16000 },
-        { model: "gemini-3.1-flash-lite", delayBeforeMs: 400, timeoutMs: 20000 },
+        { model: "gemini-3.1-flash-lite", delayBeforeMs: 0, timeoutMs: 11000 },
+        { model: "gemini-4-hydrogen", thinkingLevel: ThinkingLevel.LOW, delayBeforeMs: 1100, timeoutMs: 11000 },
+        { model: "gemini-3.1-flash-lite", delayBeforeMs: 1800, timeoutMs: 12000 },
       ];
-
-      const now = Date.now();
-      const primaryCooldownUntil = modelQuotaCooldown.get(`${keyFingerprint}:gemini-4-hydrogen`) || 0;
-      hadDailyQuota429 = now < primaryCooldownUntil;
-
-      let attemptSchedule = baseSchedule.filter((cfg) => {
-        const quotaUntil = modelQuotaCooldown.get(`${keyFingerprint}:${cfg.model}`) || 0;
-        const transientUntil = modelTransientCooldown.get(`${keyFingerprint}:${cfg.model}`) || 0;
-        return now >= quotaUntil && now >= transientUntil;
-      });
-      if (attemptSchedule.length === 0) {
-        attemptSchedule = [
-          { model: "gemini-3.1-flash-lite", delayBeforeMs: 0, timeoutMs: 20000 },
-          { model: "gemini-4-hydrogen", thinkingLevel: ThinkingLevel.LOW, delayBeforeMs: 600, timeoutMs: 22000 },
-        ];
-      }
 
       let response: any = null;
       let lastErr: any = null;
-      let prevModel: string | null = null;
+      let primaryModelErr: any = null;
+      let skipPrimaryForRequest = false;
 
-      for (const cfg of attemptSchedule) {
-        const sameModelRetry = prevModel === cfg.model;
-        prevModel = cfg.model;
-        if (sameModelRetry && cfg.delayBeforeMs > 0) {
-          const jitter = Math.floor(Math.random() * 150);
+      for (let idx = 0; idx < attemptSchedule.length; idx++) {
+        const baseCfg = attemptSchedule[idx];
+        const cfg =
+          skipPrimaryForRequest && baseCfg.model === "gemini-4-hydrogen"
+            ? { ...baseCfg, model: "gemini-3.1-flash-lite", thinkingLevel: undefined }
+            : baseCfg;
+
+        if (idx > 0 && cfg.delayBeforeMs > 0) {
+          const jitter = Math.floor(Math.random() * 350);
           await new Promise(resolve => setTimeout(resolve, cfg.delayBeforeMs + jitter));
         }
         try {
@@ -798,14 +785,12 @@ async function startServer() {
             }
           });
           if (response?.text) {
-            modelTransientCooldown.delete(`${keyFingerprint}:${cfg.model}`);
             break;
           }
         } catch (e: any) {
           lastErr = e;
           const rawMsg = String(e?.message || e || '');
           const upper = rawMsg.toUpperCase();
-          console.warn(`[generate-metadata] ${cfg.model} (user-key) failed:`, rawMsg.slice(0, 220));
           if (
             cfg.model === "gemini-4-hydrogen" &&
             !upper.includes('503') &&
@@ -815,17 +800,11 @@ async function startServer() {
           ) {
             primaryModelErr = e;
           }
-          if (recordModelCooldownIfDailyQuota(keyFingerprint, cfg.model, rawMsg)) {
-            hadDailyQuota429 = true;
-          } else if (
-            upper.includes('503') ||
-            upper.includes('UNAVAILABLE') ||
-            upper.includes('HIGH DEMAND') ||
-            upper.includes('ABORT') ||
-            upper.includes('TIMEOUT')
+          if (
+            cfg.model === "gemini-4-hydrogen" &&
+            (/GenerateRequestsPerDay|limit:\s*0\b/i.test(rawMsg) || upper.includes('429'))
           ) {
-            // Soft-deprioritize a slow/busy model for 90s so subsequent batch items go straight to the healthy fast model
-            modelTransientCooldown.set(`${keyFingerprint}:${cfg.model}`, Date.now() + 90 * 1000);
+            skipPrimaryForRequest = true;
           }
 
           if (
@@ -850,16 +829,14 @@ async function startServer() {
       res.json(result);
     } catch (err: any) {
       const raw = String(err?.message || '');
-      let cleanMsg = extractCleanUpstreamError(err, "AI metadata generation failed");
+      const cleanMsg = extractCleanUpstreamError(err, "AI metadata generation failed");
       const isBusy503 = raw.includes('503') || raw.includes('UNAVAILABLE') || raw.includes('high demand');
-      if (isBusy503 && hadDailyQuota429) {
-        cleanMsg = 'Your Gemini API key has reached its free-tier daily quota (429) and the fallback model is temporarily busy (503). Please try another key or Groq key in AI Configuration.';
-      }
-      console.warn("Metadata generation failed:", cleanMsg);
-      // Avoid HTTP 403/502/503/504 so upstream reverse proxy (nginx proxy_intercept_errors) preserves JSON instead of replacing with HTML error pages
       const isQuota429 = raw.includes('429') || raw.includes('RESOURCE_EXHAUSTED');
       const isAuth403 = raw.includes('API_KEY_INVALID') || raw.includes('PERMISSION_DENIED') || raw.includes('403');
       const status = isQuota429 || isBusy503 ? 429 : isAuth403 ? 401 : 500;
+      if (status === 500) {
+        console.warn("Metadata generation error:", cleanMsg);
+      }
       res.status(status).json({
         error: cleanMsg,
         upstreamStatus: isQuota429 ? 429 : isBusy503 ? 503 : isAuth403 ? 403 : 500
@@ -1119,21 +1096,6 @@ ${hasReferenceImage ? 'REFERENCE IMAGE ATTACHED: Dissect the image in visualAnal
 ${recentConcepts && recentConcepts.length > 0 ? `- Avoid repeating: ${recentConcepts.slice(-10).join(' | ')}` : ''}`;
   }
 
-  const modelQuotaCooldown = new Map<string, number>();
-  const modelTransientCooldown = new Map<string, number>();
-
-  function recordModelCooldownIfDailyQuota(keyFingerprint: string, model: string, rawMsg: string): boolean {
-    const isDailyQuota =
-      /GenerateRequestsPerDay|PerDay|limit:\s*0\b/i.test(rawMsg) ||
-      (rawMsg.includes('429') && /requests per day/i.test(rawMsg));
-    if (isDailyQuota) {
-      // Skip this daily-exhausted model on this key for 5 minutes so requests route straight to fallback models
-      modelQuotaCooldown.set(`${keyFingerprint}:${model}`, Date.now() + 5 * 60 * 1000);
-      return true;
-    }
-    return false;
-  }
-
   function extractCleanUpstreamError(err: any, fallbackMsg: string): string {
     let raw = String(err?.message || fallbackMsg || '').trim();
     if (raw.startsWith('{') || raw.includes('"error"')) {
@@ -1152,11 +1114,10 @@ ${recentConcepts && recentConcepts.length > 0 ? `- Avoid repeating: ${recentConc
     if (raw.includes('API_KEY_INVALID') || raw.includes('API key not valid')) {
       return 'Gemini API key is invalid or unauthorized. Please check your key in AI Configuration.';
     }
-    if (/GenerateRequestsPerDay|requests per day/i.test(raw)) {
-      return 'Free-tier daily Gemini quota reached (429). Add your own Gemini or Groq key in AI Configuration, or retry after quota reset.';
-    }
     if (raw.includes('429') || raw.includes('RESOURCE_EXHAUSTED') || raw.includes('quota')) {
-      return 'Gemini API rate/quota limit reached (429). Please wait a moment and retry.';
+      const retryMatch = raw.match(/retry\s+in\s+([\d.]+)s/i);
+      const retryHint = retryMatch ? ` (retry in ${Math.ceil(Number(retryMatch[1]))}s)` : '';
+      return `Google Gemini API rate limit reached on your API key${retryHint}. Please wait a moment or add an additional key in AI Configuration.`;
     }
     if (
       raw.includes('Unterminated string') ||
@@ -1363,7 +1324,7 @@ ${recentConcepts && recentConcepts.length > 0 ? `- Avoid repeating: ${recentConc
         : userPrompt;
 
       // Primary: Gemini 4 Hydrogen (LOW thinking, 16s single / 26s batch cap)
-      // Fallback: Gemini 3.1 Flash-Lite with instant switch and cooldown tracking
+      // Fallback: Gemini 3.1 Flash-Lite with instant switch (zero persistent key lockouts)
       const candidateConfigs: Array<{ model: string; thinkingConfig?: any; timeoutMs: number }> = [
         {
           model: "gemini-4-hydrogen",
@@ -1377,22 +1338,11 @@ ${recentConcepts && recentConcepts.length > 0 ? `- Avoid repeating: ${recentConc
         },
       ];
 
-      const keyFingerprint = crypto.createHash('sha256').update(customKey).digest('hex').slice(0, 12);
-      const now = Date.now();
-      let activeCandidates = candidateConfigs.filter((cfg) => {
-        const quotaUntil = modelQuotaCooldown.get(`${keyFingerprint}:${cfg.model}`) || 0;
-        const transientUntil = modelTransientCooldown.get(`${keyFingerprint}:${cfg.model}`) || 0;
-        return now >= quotaUntil && now >= transientUntil;
-      });
-      if (activeCandidates.length === 0) {
-        activeCandidates = [candidateConfigs[candidateConfigs.length - 1], candidateConfigs[0]];
-      }
-
       let blueprints: any[] = [];
       let lastErr: any = null;
       const maxTokens = safeCount === 1 ? 4608 : 10240;
 
-      for (const cfg of activeCandidates) {
+      for (const cfg of candidateConfigs) {
         try {
           const response = await ai.models.generateContent({
             model: cfg.model,
@@ -1429,24 +1379,11 @@ ${recentConcepts && recentConcepts.length > 0 ? `- Avoid repeating: ${recentConc
           if (list.length === 0) {
             throw new Error(`Model ${cfg.model} returned an empty blueprint list.`);
           }
-          modelTransientCooldown.delete(`${keyFingerprint}:${cfg.model}`);
           blueprints = list;
           break;
         } catch (err: any) {
           lastErr = err;
-          const rawMsg = String(err?.message || err || "");
-          const msg = rawMsg.toUpperCase();
-          if (recordModelCooldownIfDailyQuota(keyFingerprint, cfg.model, rawMsg)) {
-            // Daily quota recorded
-          } else if (
-            msg.includes("503") ||
-            msg.includes("UNAVAILABLE") ||
-            msg.includes("HIGH DEMAND") ||
-            msg.includes("ABORT") ||
-            msg.includes("TIMEOUT")
-          ) {
-            modelTransientCooldown.set(`${keyFingerprint}:${cfg.model}`, Date.now() + 90 * 1000);
-          }
+          const msg = String(err?.message || err || "").toUpperCase();
           if (msg.includes("API_KEY") || msg.includes("PERMISSION_DENIED") || msg.includes("403")) {
             break;
           }

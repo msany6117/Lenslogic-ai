@@ -85,13 +85,7 @@ export async function generateMetadata(
     throw new Error("Could not encode image preview for AI analysis. Please attach a valid JPG or PNG preview.");
   }
 
-  // If the user explicitly has a Groq key active, use Groq provider directly
-  if (activeKey && activeKey.provider === 'Groq' && activeKey.key?.trim()) {
-    const prompt = buildSeoPrompt(settings, assetType, fileExtension);
-    return await callGroq(optimizedBase64, prompt, activeKey.key.trim(), settings, assetType, fileExtension);
-  }
-
-  // Collect user-provided Gemini API keys (active key first)
+  // Collect user-provided keys per provider (active key first)
   const orderedGeminiKeys: string[] = [];
   if (activeKey?.provider === 'Gemini' && activeKey.key?.trim()) {
     orderedGeminiKeys.push(activeKey.key.trim());
@@ -102,11 +96,46 @@ export async function generateMetadata(
       orderedGeminiKeys.push(trimmed);
     }
   }
+
+  const orderedGroqKeys: string[] = [];
+  if (activeKey?.provider === 'Groq' && activeKey.key?.trim()) {
+    orderedGroqKeys.push(activeKey.key.trim());
+  }
+  for (const entry of settings.apiKeys || []) {
+    const trimmed = entry?.provider === 'Groq' ? entry.key?.trim() : '';
+    if (trimmed && !orderedGroqKeys.includes(trimmed)) {
+      orderedGroqKeys.push(trimmed);
+    }
+  }
+
+  const runGroqFailover = async (prompt: string) => {
+    let lastGroqErr: any = null;
+    for (const groqKey of orderedGroqKeys) {
+      try {
+        return await callGroq(optimizedBase64, prompt, groqKey, settings, assetType, fileExtension);
+      } catch (err: any) {
+        lastGroqErr = err;
+      }
+    }
+    throw lastGroqErr || new Error("Groq metadata generation failed.");
+  };
+
+  // If the user explicitly has a Groq key active, try Groq keys first (with optional fallback to Gemini keys)
+  if (activeKey && activeKey.provider === 'Groq' && activeKey.key?.trim()) {
+    const prompt = buildSeoPrompt(settings, assetType, fileExtension);
+    try {
+      return await runGroqFailover(prompt);
+    } catch (groqErr: any) {
+      if (orderedGeminiKeys.length === 0) {
+        throw groqErr;
+      }
+    }
+  }
+
   if (orderedGeminiKeys.length === 0) {
-    const fallbackGroq = (settings.apiKeys || []).find((k) => k?.provider === 'Groq' && k.key?.trim());
-    if (fallbackGroq?.key?.trim()) {
+    if (orderedGroqKeys.length > 0) {
       const prompt = buildSeoPrompt(settings, assetType, fileExtension);
-      return await callGroq(optimizedBase64, prompt, fallbackGroq.key.trim(), settings, assetType, fileExtension);
+      return await runGroqFailover(prompt);
     }
     throw new Error("API key required. Please add your Gemini or Groq API key in AI Configuration.");
   }
@@ -120,24 +149,35 @@ export async function generateMetadata(
       fileExtension
     });
 
-    const primaryUrl = getApiUrl("/api/generate-metadata");
-    const candidateUrls = primaryUrl !== "/api/generate-metadata"
-      ? [primaryUrl, "/api/generate-metadata"]
-      : [primaryUrl];
+    const configuredUrl = getApiUrl("/api/generate-metadata");
+    // Always prefer same-origin /api/generate-metadata first so stale localStorage URLs never cause Failed to fetch
+    const candidateUrls = configuredUrl !== "/api/generate-metadata"
+      ? ["/api/generate-metadata", configuredUrl]
+      : ["/api/generate-metadata"];
 
     let lastFetchErr: Error | null = null;
 
     for (let idx = 0; idx < candidateUrls.length; idx++) {
       const targetUrl = candidateUrls[idx];
-      let response: Response;
-      try {
-        response = await fetch(targetUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: payload
-        });
-      } catch (networkErr: any) {
-        lastFetchErr = networkErr instanceof Error ? networkErr : new Error("Network request failed");
+      let response: Response | null = null;
+
+      for (let netAttempt = 0; netAttempt < 2; netAttempt++) {
+        try {
+          response = await fetch(targetUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: payload
+          });
+          break;
+        } catch (networkErr: any) {
+          lastFetchErr = networkErr instanceof Error ? networkErr : new Error("Network request failed");
+          if (netAttempt === 0) {
+            await new Promise((resolve) => setTimeout(resolve, 500));
+          }
+        }
+      }
+
+      if (!response) {
         continue;
       }
 
@@ -154,7 +194,6 @@ export async function generateMetadata(
 
       const isHtml = contentType.includes("text/html") || /^\s*<!doctype|^\s*<html/i.test(rawBody);
       if (isHtml && idx < candidateUrls.length - 1) {
-        // Stale custom API URL returned HTML; retry on same-origin /api/generate-metadata
         continue;
       }
 
@@ -184,6 +223,9 @@ export async function generateMetadata(
       return parseAndPolish(JSON.stringify(parsedBody), settings, assetType, fileExtension);
     }
 
+    if (lastFetchErr && /failed to fetch|network/i.test(lastFetchErr.message)) {
+      throw new Error("Could not reach the metadata server. Please check your connection or refresh the page and try again.");
+    }
     throw lastFetchErr || new Error("Failed to reach metadata API endpoint.");
   };
 
@@ -204,9 +246,19 @@ export async function generateMetadata(
         msg.includes('503') ||
         msg.includes('quota') ||
         msg.includes('busy');
-      if (!isRetryableWithNextKey || i === orderedGeminiKeys.length - 1) {
+      if (!isRetryableWithNextKey) {
         throw err;
       }
+    }
+  }
+
+  // If all Gemini keys hit 503/429/auth and user also configured a Groq key, fail over cleanly to Groq
+  if (orderedGroqKeys.length > 0) {
+    try {
+      const prompt = buildSeoPrompt(settings, assetType, fileExtension);
+      return await runGroqFailover(prompt);
+    } catch {
+      // Surface the primary Gemini error if Groq fallback also fails
     }
   }
 
@@ -232,21 +284,17 @@ async function callGroq(
   // Active Groq multimodal vision models
   const candidateModels = [
     "meta-llama/llama-4-scout-17b-16e-instruct",
+    "qwen/qwen3.8-27b",
     "meta-llama/llama-4-maverick-17b-128e-instruct"
   ];
-  
+
   let lastError: any = null;
 
   for (const modelName of candidateModels) {
-    try {
-      console.log(`Analyzing image using Groq model ${modelName}...`);
-      const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${apiKey}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
+    let useJsonMode = true;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const bodyPayload: any = {
           model: modelName,
           messages: [
             {
@@ -261,42 +309,67 @@ async function callGroq(
                 }
               ]
             }
-          ],
-          response_format: { type: "json_object" }
-        })
-      });
-
-      const rawText = await response.text();
-      let result: any = null;
-      if (rawText) {
-        try {
-          result = JSON.parse(rawText);
-        } catch {
-          result = null;
+          ]
+        };
+        if (useJsonMode) {
+          bodyPayload.response_format = { type: "json_object" };
         }
-      }
 
-      if (!response.ok) {
-        throw new Error(result?.error?.message || response.statusText || `HTTP ${response.status}`);
-      }
+        const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${apiKey}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(bodyPayload)
+        });
 
-      if (!result) {
-        throw new Error("Groq returned a non-JSON response. Please try again.");
-      }
+        const rawText = await response.text();
+        let result: any = null;
+        if (rawText) {
+          try {
+            result = JSON.parse(rawText);
+          } catch {
+            result = null;
+          }
+        }
 
-      const content = result.choices?.[0]?.message?.content;
-      if (!content) {
-        throw new Error("No response content from Groq");
-      }
-      
-      return parseAndPolish(content, settings, assetType, fileExtension);
-    } catch (error: any) {
-      lastError = error;
-      const errMsg = String(error?.message || "").toUpperCase();
-      console.warn(`Groq model ${modelName} failed. Error:`, error);
-      
-      // If it's an API Key or permission error, do not fallback to other models
-      if (errMsg.includes("API_KEY") || errMsg.includes("403") || errMsg.includes("UNAUTHORIZED")) {
+        if (!response.ok) {
+          const msg = result?.error?.message || response.statusText || `HTTP ${response.status}`;
+          const err = new Error(msg) as Error & { status?: number };
+          err.status = response.status;
+          throw err;
+        }
+
+        if (!result) {
+          throw new Error("Groq returned a non-JSON response. Please try again.");
+        }
+
+        const content = result.choices?.[0]?.message?.content;
+        if (!content) {
+          throw new Error("No response content from Groq");
+        }
+
+        return parseAndPolish(content, settings, assetType, fileExtension);
+      } catch (error: any) {
+        lastError = error;
+        const status = Number(error?.status || 0);
+        const errMsg = String(error?.message || "");
+        const upper = errMsg.toUpperCase();
+
+        if (status === 400 && useJsonMode && /response_format|json_object|json/i.test(errMsg)) {
+          useJsonMode = false;
+          continue;
+        }
+
+        if ((status === 429 || status === 503 || upper.includes("RATE LIMIT") || upper.includes("OVERLOADED")) && attempt === 0) {
+          await new Promise((resolve) => setTimeout(resolve, 1200 + Math.floor(Math.random() * 400)));
+          continue;
+        }
+
+        if (status === 401 || status === 403 || upper.includes("INVALID_API_KEY") || upper.includes("INVALID API KEY") || upper.includes("UNAUTHORIZED")) {
+          throw new Error(`Groq API Error: ${errMsg}`);
+        }
         break;
       }
     }
