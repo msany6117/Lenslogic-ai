@@ -531,8 +531,8 @@ export async function renderAiOrPdfToCanvas(
  */
 export function hasVisiblePixels(canvas: HTMLCanvasElement): boolean {
   try {
-    const sampleW = Math.min(canvas.width, 150);
-    const sampleH = Math.min(canvas.height, 150);
+    const sampleW = Math.min(canvas.width, 300);
+    const sampleH = Math.min(canvas.height, 300);
     const testCanvas = document.createElement('canvas');
     testCanvas.width = sampleW;
     testCanvas.height = sampleH;
@@ -543,10 +543,10 @@ export function hasVisiblePixels(canvas: HTMLCanvasElement): boolean {
 
     let visibleCount = 0;
     for (let i = 3; i < imgData.length; i += 4) {
-      if (imgData[i] > 20) {
+      if (imgData[i] > 8) {
         visibleCount++;
-        if (visibleCount > 30) {
-          return true; // Contains real painted content
+        if (visibleCount >= 4) {
+          return true; // Contains real painted content (even thin line art)
         }
       }
     }
@@ -606,14 +606,18 @@ export function renderPostScriptPathsToCanvas(
     // Strip DOS binary header before %!PS-Adobe if present
     let workingText = psText;
     const psStartIdx = workingText.indexOf('%!PS');
-    if (psStartIdx > 0 && psStartIdx < 524288) {
+    if (psStartIdx > 0 && psStartIdx < 4194304) {
       workingText = workingText.slice(psStartIdx);
     }
 
-    // Strip bulky non-drawing blocks before tokenization so Prolog / private metadata don't exhaust tokens
+    // Strip bulky non-drawing blocks before tokenization so Prolog / ProcSets / private metadata don't exhaust tokens
     workingText = workingText
       .replace(/%%BeginProlog[\s\S]*?%%EndProlog/gi, ' ')
       .replace(/%%BeginPreview[\s\S]*?%%EndPreview/gi, ' ')
+      .replace(/%%BeginResource[\s\S]*?%%EndResource/gi, ' ')
+      .replace(/%%BeginProcSet[\s\S]*?%%EndProcSet/gi, ' ')
+      .replace(/%%BeginFont[\s\S]*?%%EndFont/gi, ' ')
+      .replace(/%%BeginBinary[\s\S]*?%%EndBinary/gi, ' ')
       .replace(/%AI9_PrivateDataBegin[\s\S]*?%AI9_PrivateDataEnd/gi, ' ')
       .replace(/%[^\r\n]*/g, ' ');
 
@@ -621,7 +625,7 @@ export function renderPostScriptPathsToCanvas(
     const tokens: string[] = [];
     const len = workingText.length;
     let idx = 0;
-    const maxTokens = 150000;
+    const maxTokens = 250000;
 
     while (idx < len && tokens.length < maxTokens) {
       const ch = workingText.charCodeAt(idx);
@@ -725,6 +729,30 @@ export function renderPostScriptPathsToCanvas(
           const vals = popN(6);
           if (vals) {
             ctx.transform(vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]);
+          }
+          numStack.length = 0;
+          break;
+        }
+        case 'translate': {
+          const vals = popN(2);
+          if (vals) {
+            ctx.translate(vals[0], vals[1]);
+          }
+          numStack.length = 0;
+          break;
+        }
+        case 'scale': {
+          const vals = popN(2);
+          if (vals) {
+            ctx.scale(vals[0], vals[1]);
+          }
+          numStack.length = 0;
+          break;
+        }
+        case 'rotate': {
+          const vals = popN(1);
+          if (vals) {
+            ctx.rotate((vals[0] * Math.PI) / 180);
           }
           numStack.length = 0;
           break;
@@ -859,6 +887,20 @@ export function renderPostScriptPathsToCanvas(
           numStack.length = 0;
           break;
         }
+        case 'rmoveto': {
+          const vals = popN(2);
+          if (vals) {
+            if (!pathStarted) {
+              ctx.beginPath();
+              pathStarted = true;
+            }
+            currentX += vals[0];
+            currentY += vals[1];
+            ctx.moveTo(currentX, currentY);
+          }
+          numStack.length = 0;
+          break;
+        }
         case 'l':
         case 'L':
         case 'lineto': {
@@ -870,6 +912,20 @@ export function renderPostScriptPathsToCanvas(
             }
             currentX = vals[0];
             currentY = vals[1];
+            ctx.lineTo(currentX, currentY);
+          }
+          numStack.length = 0;
+          break;
+        }
+        case 'rlineto': {
+          const vals = popN(2);
+          if (vals) {
+            if (!pathStarted) {
+              ctx.beginPath();
+              pathStarted = true;
+            }
+            currentX += vals[0];
+            currentY += vals[1];
             ctx.lineTo(currentX, currentY);
           }
           numStack.length = 0;
@@ -887,6 +943,43 @@ export function renderPostScriptPathsToCanvas(
             ctx.bezierCurveTo(vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]);
             currentX = vals[4];
             currentY = vals[5];
+          }
+          numStack.length = 0;
+          break;
+        }
+        case 'rcurveto': {
+          const vals = popN(6);
+          if (vals) {
+            if (!pathStarted) {
+              ctx.beginPath();
+              pathStarted = true;
+            }
+            const x1 = currentX + vals[0];
+            const y1 = currentY + vals[1];
+            const x2 = currentX + vals[2];
+            const y2 = currentY + vals[3];
+            const x3 = currentX + vals[4];
+            const y3 = currentY + vals[5];
+            ctx.bezierCurveTo(x1, y1, x2, y2, x3, y3);
+            currentX = x3;
+            currentY = y3;
+          }
+          numStack.length = 0;
+          break;
+        }
+        case 'arc':
+        case 'arcn': {
+          const vals = popN(5);
+          if (vals) {
+            if (!pathStarted) {
+              ctx.beginPath();
+              pathStarted = true;
+            }
+            const a1 = (vals[3] * Math.PI) / 180;
+            const a2 = (vals[4] * Math.PI) / 180;
+            ctx.arc(vals[0], vals[1], Math.abs(vals[2]), a1, a2, tok === 'arcn');
+            currentX = vals[0] + Math.abs(vals[2]) * Math.cos(a2);
+            currentY = vals[1] + Math.abs(vals[2]) * Math.sin(a2);
           }
           numStack.length = 0;
           break;
@@ -931,6 +1024,24 @@ export function renderPostScriptPathsToCanvas(
               pathStarted = true;
             }
             ctx.rect(vals[0], vals[1], vals[2], vals[3]);
+          }
+          numStack.length = 0;
+          break;
+        }
+        case 'rectfill': {
+          const vals = popN(4);
+          if (vals) {
+            ctx.fillRect(vals[0], vals[1], vals[2], vals[3]);
+            paintedActions++;
+          }
+          numStack.length = 0;
+          break;
+        }
+        case 'rectstroke': {
+          const vals = popN(4);
+          if (vals) {
+            ctx.strokeRect(vals[0], vals[1], vals[2], vals[3]);
+            paintedActions++;
           }
           numStack.length = 0;
           break;
@@ -1529,14 +1640,28 @@ export async function loadVectorPreview(
   const decodePsTextWithBounds = (buffer: ArrayBuffer): string => {
     const decoder = new TextDecoder('latin1');
     const bytes = new Uint8Array(buffer);
-    const limit = Math.min(bytes.length, 6291456); // up to 6MB
-    let text = decoder.decode(bytes.subarray(0, limit));
+    let psStart = 0;
+    let psEnd = bytes.length;
+    if (bytes.length >= 30) {
+      const view = new DataView(buffer);
+      if (view.getUint32(0, false) === 0xc5d0d3c6) {
+        const off = view.getUint32(4, true);
+        const psLen = view.getUint32(8, true);
+        if (off < bytes.length && psLen > 0) {
+          psStart = off;
+          psEnd = Math.min(bytes.length, off + psLen);
+        }
+      }
+    }
+    const sliceLen = Math.min(psEnd - psStart, 6291456); // up to 6MB of PostScript body
+    let text = decoder.decode(bytes.subarray(psStart, psStart + sliceLen));
     // If BoundingBox is at the end (e.g. %%BoundingBox: (atend)), prepend tail header comments
     if (
-      bytes.length > limit &&
+      psEnd - psStart > sliceLen &&
       !/%%(?:HiRes)?BoundingBox:\s*[-\d.]+/i.test(text.slice(0, 65536))
     ) {
-      const tailText = decoder.decode(bytes.subarray(Math.max(0, bytes.length - 65536)));
+      const tailStart = Math.max(psStart, psEnd - 65536);
+      const tailText = decoder.decode(bytes.subarray(tailStart, psEnd));
       const tailMatch = tailText.match(/%%(?:HiRes)?BoundingBox:\s*[-\d.]+\s+[-\d.]+\s+[-\d.]+\s+[-\d.]+/i);
       if (tailMatch) {
         text = `${tailMatch[0]}\n${text}`;
