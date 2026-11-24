@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   Package, 
   Upload, 
@@ -16,7 +16,6 @@ import {
   Sliders,
   CheckCheck,
   PenTool,
-  FileType,
   FileCode2,
   ShieldCheck
 } from 'lucide-react';
@@ -29,8 +28,7 @@ import {
 } from '../services/freepikService';
 import { 
   convertFileToFreepikVectorPack, 
-  loadVectorPreview,
-  extractEmbeddedThumbnail, 
+  loadVectorPreview, 
   type FreepikVectorResult 
 } from '../services/vectorService';
 type StudioMode = 'psd' | 'vector';
@@ -84,43 +82,47 @@ export default function FreepikConverter() {
   const [vectorResult, setVectorResult] = useState<FreepikVectorResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // When preview URL or file changes, analyze dimensions and alpha transparency
+  // Track active blob URLs for safe cleanup without leaks
+  const previewUrlRef = useRef<string | null>(null);
+  const psdZipUrlRef = useRef<string | null>(null);
+  const vectorZipUrlRef = useRef<string | null>(null);
+
+  const setSafePreviewUrl = (nextUrl: string | null) => {
+    const prev = previewUrlRef.current;
+    if (prev && prev !== nextUrl && prev.startsWith('blob:')) {
+      URL.revokeObjectURL(prev);
+    }
+    previewUrlRef.current = nextUrl;
+    setPreviewUrl(nextUrl);
+  };
+
   useEffect(() => {
-    if (!previewUrl) return;
-
-    let isSubscribed = true;
-    loadImage(previewUrl)
-      .then((img) => {
-        if (!isSubscribed) return;
-        const w = img.naturalWidth || img.width;
-        const h = img.naturalHeight || img.height;
-        if (w && h) {
-          setDetectedDimensions({
-            width: w,
-            height: h,
-            aspect: getAspectRatioLabel(w, h)
-          });
-        }
-
-        const hasAlpha = detectTransparency(img);
-        setIsTransparentDetected(hasAlpha);
-
-        if (hasAlpha) {
-          setEnableTransparentPsd(true);
-          setPreviewBgStyle('checkerboard');
-        } else {
-          setEnableTransparentPsd(false);
-          setPreviewBgStyle('solid');
-        }
-      })
-      .catch((err) => {
-        console.warn('Could not inspect image transparency:', err);
-      });
-
     return () => {
-      isSubscribed = false;
+      if (previewUrlRef.current?.startsWith('blob:')) URL.revokeObjectURL(previewUrlRef.current);
+      if (psdZipUrlRef.current?.startsWith('blob:')) URL.revokeObjectURL(psdZipUrlRef.current);
+      if (vectorZipUrlRef.current?.startsWith('blob:')) URL.revokeObjectURL(vectorZipUrlRef.current);
     };
-  }, [previewUrl]);
+  }, []);
+
+  const clearConversionResults = () => {
+    if (psdZipUrlRef.current?.startsWith('blob:')) URL.revokeObjectURL(psdZipUrlRef.current);
+    if (vectorZipUrlRef.current?.startsWith('blob:')) URL.revokeObjectURL(vectorZipUrlRef.current);
+    psdZipUrlRef.current = null;
+    vectorZipUrlRef.current = null;
+    setPsdResult(null);
+    setVectorResult(null);
+  };
+
+  const applyAlphaUiState = (hasAlpha: boolean) => {
+    setIsTransparentDetected(hasAlpha);
+    if (hasAlpha) {
+      setEnableTransparentPsd(true);
+      setPreviewBgStyle('checkerboard');
+    } else {
+      setEnableTransparentPsd(false);
+      setPreviewBgStyle('solid');
+    }
+  };
 
   const onDrop = async (acceptedFiles: File[]) => {
     if (acceptedFiles.length > 0) {
@@ -136,8 +138,7 @@ export default function FreepikConverter() {
       setSelectedFile(file);
       setCustomPreviewFile(null);
       setCustomName(file.name.replace(/\.[^/.]+$/, ''));
-      setPsdResult(null);
-      setVectorResult(null);
+      clearConversionResults();
       setError(null);
       setImgError(false);
 
@@ -148,15 +149,8 @@ export default function FreepikConverter() {
       setIsParsingPreview(true);
       try {
         const previewInfo = await loadVectorPreview(file);
-        setPreviewUrl(previewInfo.previewUrl);
-        setIsTransparentDetected(previewInfo.isTransparent);
-        if (previewInfo.isTransparent) {
-          setPreviewBgStyle('checkerboard');
-          setEnableTransparentPsd(true);
-        } else {
-          setPreviewBgStyle('solid');
-          setEnableTransparentPsd(false);
-        }
+        setSafePreviewUrl(previewInfo.previewUrl);
+        applyAlphaUiState(previewInfo.isTransparent);
         if (previewInfo.width && previewInfo.height) {
           setDetectedDimensions({
             width: previewInfo.width,
@@ -169,12 +163,19 @@ export default function FreepikConverter() {
         if (file.type && file.type.startsWith('image/') && !file.name.endsWith('.ai') && !file.name.endsWith('.eps')) {
           try {
             const url = URL.createObjectURL(file);
-            setPreviewUrl(url);
+            setSafePreviewUrl(url);
+            const img = await loadImage(url);
+            const w = img.naturalWidth || img.width;
+            const h = img.naturalHeight || img.height;
+            if (w && h) {
+              setDetectedDimensions({ width: w, height: h, aspect: getAspectRatioLabel(w, h) });
+            }
+            applyAlphaUiState(detectTransparency(img));
           } catch {
-            setPreviewUrl(null);
+            setSafePreviewUrl(null);
           }
         } else {
-          setPreviewUrl(null);
+          setSafePreviewUrl(null);
         }
       } finally {
         setIsParsingPreview(false);
@@ -217,12 +218,11 @@ export default function FreepikConverter() {
           targetWidth: detectedDimensions?.width,
           targetHeight: detectedDimensions?.height,
           dpi: customDpi,
-          previewBgStyle: previewBgStyle,
-          backgroundColor: bgColor,
           customPreviewSource: customPreviewFile || undefined
         });
+        clearConversionResults();
+        vectorZipUrlRef.current = vResult.zipUrl;
         setVectorResult(vResult);
-        setPsdResult(null);
       } else {
         // Convert to Freepik PSD Pack (2MB - 200MB) with 100% original dimensions
         const pResult = await convertFileToFreepikPsdPack(source, baseTitle, {
@@ -235,8 +235,9 @@ export default function FreepikConverter() {
           backgroundColor: bgColor,
           addEditableBackgroundLayer: addEditableBgLayer
         });
+        clearConversionResults();
+        psdZipUrlRef.current = pResult.zipUrl;
         setPsdResult(pResult);
-        setVectorResult(null);
       }
     } catch (err: any) {
       console.error('Freepik conversion error:', err);
@@ -312,7 +313,7 @@ export default function FreepikConverter() {
                     <Layers className="w-4 h-4" />
                   </div>
                   <div className="text-left">
-                    <p className="text-[11px] font-bold text-slate-800 leading-none">300 PPI & Alpha</p>
+                    <p className="text-[11px] font-bold text-slate-800 leading-none">{customDpi} PPI & Alpha</p>
                     <p className="text-[10px] text-slate-500 mt-0.5">Transparent PSD Ready</p>
                   </div>
                 </div>
@@ -394,39 +395,47 @@ export default function FreepikConverter() {
               </div>
             ) : selectedFile || previewUrl ? (
               <div className="space-y-4">
-                <div 
-                  className={`relative w-56 h-56 mx-auto rounded-2xl overflow-hidden border border-slate-200 shadow-md flex items-center justify-center ${
-                    isTransparentDetected 
-                      ? 'bg-[linear-gradient(45deg,#f1f5f9_25%,transparent_25%),linear-gradient(-45deg,#f1f5f9_25%,transparent_25%),linear-gradient(45deg,transparent_75%,#f1f5f9_75%),linear-gradient(-45deg,transparent_75%,#f1f5f9_75%)] bg-[size:20px_20px] bg-[position:0_0,0_10px,10px_-10px,-10px_0px] bg-white' 
-                      : 'bg-slate-100'
-                  }`}
-                >
-                  {previewUrl && !imgError ? (
-                    <img 
-                      src={previewUrl} 
-                      alt="Vector Artwork Preview" 
-                      className="w-full h-full object-contain p-2" 
-                      onError={() => {
-                        console.warn('Image load error on previewUrl, switching to vector badge');
-                        setImgError(true);
-                      }}
-                    />
-                  ) : (
-                    <div className="flex flex-col items-center justify-center p-4 text-center">
-                      <FileCode2 className="w-12 h-12 text-amber-600 mb-2" />
-                      <p className="text-xs font-bold text-slate-800 break-all">{selectedFile?.name || customName}</p>
-                      <span className="text-[10px] text-amber-700 font-semibold mt-1">
-                        {selectedFile?.name?.endsWith('.ai') ? 'Adobe Illustrator (.ai)' : selectedFile?.name?.endsWith('.eps') ? 'PostScript Vector (.eps)' : 'Vector / Graphic Asset'}
-                      </span>
-                    </div>
-                  )}
+                <div className="w-full flex justify-center">
+                  <div
+                    className={`relative inline-flex items-center justify-center rounded-2xl overflow-hidden border border-slate-200 shadow-md max-w-full ${
+                      isTransparentDetected
+                        ? 'bg-[linear-gradient(45deg,#f1f5f9_25%,transparent_25%),linear-gradient(-45deg,#f1f5f9_25%,transparent_25%),linear-gradient(45deg,transparent_75%,#f1f5f9_75%),linear-gradient(-45deg,transparent_75%,#f1f5f9_75%)] bg-[size:20px_20px] bg-[position:0_0,0_10px,10px_-10px,-10px_0px] bg-white'
+                        : 'bg-slate-100'
+                    }`}
+                  >
+                    {previewUrl && !imgError ? (
+                      <img
+                        src={previewUrl}
+                        alt="Artwork Preview"
+                        className={`block max-w-full max-h-[540px] w-auto h-auto object-contain ${
+                          detectedDimensions && detectedDimensions.width < 420 && detectedDimensions.height < 420
+                            ? detectedDimensions.width >= detectedDimensions.height
+                              ? 'min-w-[320px] sm:min-w-[440px]'
+                              : 'min-h-[380px]'
+                            : ''
+                        }`}
+                        onError={() => {
+                          console.warn('Image load error on previewUrl, switching to vector badge');
+                          setImgError(true);
+                        }}
+                      />
+                    ) : (
+                      <div className="flex flex-col items-center justify-center px-12 py-14 text-center min-w-[280px]">
+                        <FileCode2 className="w-14 h-14 text-amber-600 mb-3" />
+                        <p className="text-sm font-bold text-slate-800 break-all">{selectedFile?.name || customName}</p>
+                        <span className="text-xs text-amber-700 font-semibold mt-1">
+                          {selectedFile?.name?.endsWith('.ai') ? 'Adobe Illustrator (.ai)' : selectedFile?.name?.endsWith('.eps') ? 'PostScript Vector (.eps)' : 'Vector / Graphic Asset'}
+                        </span>
+                      </div>
+                    )}
 
-                  {isTransparentDetected && previewUrl && (
-                    <div className="absolute top-2 right-2 px-2 py-0.5 rounded-md bg-slate-900/80 backdrop-blur-xs text-[9px] font-bold text-white flex items-center gap-1 shadow-xs">
-                      <Grid className="w-3 h-3 text-indigo-400" />
-                      Transparent Background
-                    </div>
-                  )}
+                    {isTransparentDetected && previewUrl && !imgError && (
+                      <div className="absolute top-3 right-3 px-2.5 py-1 rounded-lg bg-slate-900/80 backdrop-blur-xs text-[10px] font-bold text-white flex items-center gap-1.5 shadow-xs">
+                        <Grid className="w-3.5 h-3.5 text-indigo-400" />
+                        Transparent Background
+                      </div>
+                    )}
+                  </div>
                 </div>
 
                 <div>
@@ -576,46 +585,6 @@ export default function FreepikConverter() {
                   </span>
                 </div>
 
-                {/* Preview JPG Background Style */}
-                <div className="space-y-1.5">
-                  <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">
-                    Preview JPG Background
-                  </span>
-                  <div className="grid grid-cols-2 gap-2">
-                    <button
-                      type="button"
-                      onClick={() => setPreviewBgStyle('checkerboard')}
-                      className={`p-2 rounded-xl border text-left transition-all cursor-pointer flex items-center gap-2.5 ${
-                        previewBgStyle === 'checkerboard'
-                          ? 'bg-amber-50 border-amber-400 text-amber-900 ring-1 ring-amber-200'
-                          : 'bg-slate-50 border-slate-200 hover:bg-slate-100 text-slate-700'
-                      }`}
-                    >
-                      <div className="w-6 h-6 rounded-md border border-slate-300 shrink-0 bg-[linear-gradient(45deg,#cbd5e1_25%,transparent_25%),linear-gradient(-45deg,#cbd5e1_25%,transparent_25%),linear-gradient(45deg,transparent_75%,#cbd5e1_75%),linear-gradient(-45deg,transparent_75%,#cbd5e1_75%)] bg-[size:8px_8px] bg-[position:0_0,0_4px,4px_-4px,-4px_0px] bg-white" />
-                      <div>
-                        <p className="text-[11px] font-bold leading-tight">Checkerboard</p>
-                        <p className="text-[9px] text-slate-400">Shows transparency</p>
-                      </div>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => setPreviewBgStyle('solid')}
-                      className={`p-2 rounded-xl border text-left transition-all cursor-pointer flex items-center gap-2.5 ${
-                        previewBgStyle === 'solid'
-                          ? 'bg-amber-50 border-amber-400 text-amber-900 ring-1 ring-amber-200'
-                          : 'bg-slate-50 border-slate-200 hover:bg-slate-100 text-slate-700'
-                      }`}
-                    >
-                      <div className="w-6 h-6 rounded-md border border-slate-300 shrink-0 bg-white" />
-                      <div>
-                        <p className="text-[11px] font-bold leading-tight">Solid Background</p>
-                        <p className="text-[9px] text-slate-400">Pure white preview</p>
-                      </div>
-                    </button>
-                  </div>
-                </div>
-
                 {/* Optional Custom Preview Image for Vector EPS */}
                 <div className="space-y-1.5 pt-2 border-t border-slate-100">
                   <div className="flex items-center justify-between">
@@ -642,13 +611,28 @@ export default function FreepikConverter() {
                         type="file"
                         accept="image/*"
                         className="sr-only"
-                        onChange={(e) => {
+                        onChange={async (e) => {
                           if (e.target.files && e.target.files[0]) {
                             const pFile = e.target.files[0];
                             setCustomPreviewFile(pFile);
                             const url = URL.createObjectURL(pFile);
-                            setPreviewUrl(url);
+                            setSafePreviewUrl(url);
                             setImgError(false);
+                            try {
+                              const img = await loadImage(url);
+                              const w = img.naturalWidth || img.width;
+                              const h = img.naturalHeight || img.height;
+                              if (w && h && !detectedDimensions) {
+                                setDetectedDimensions({
+                                  width: w,
+                                  height: h,
+                                  aspect: getAspectRatioLabel(w, h)
+                                });
+                              }
+                              applyAlphaUiState(detectTransparency(img));
+                            } catch {
+                              // Keep existing dimensions if inspection fails
+                            }
                           }
                         }}
                       />
@@ -660,8 +644,9 @@ export default function FreepikConverter() {
                           setCustomPreviewFile(null);
                           if (selectedFile) {
                             loadVectorPreview(selectedFile).then((info) => {
-                              setPreviewUrl(info.previewUrl);
+                              setSafePreviewUrl(info.previewUrl);
                               setImgError(false);
+                              applyAlphaUiState(info.isTransparent);
                               if (info.width && info.height) {
                                 setDetectedDimensions({
                                   width: info.width,
@@ -926,7 +911,7 @@ export default function FreepikConverter() {
                   <span className="text-[10px] text-slate-400 block">
                     {studioMode === 'vector'
                       ? 'Original EPS Vector File (Preserved & 1MB–70MB Standardized)'
-                      : (psdResult?.isTransparent ? 'Transparent Canvas • 300 PPI' : 'Layered • 300 PPI')}
+                      : `${psdResult?.isTransparent ? 'Transparent Canvas' : 'Layered'} • ${activeResult.dpi} PPI`}
                   </span>
                 </div>
               </div>

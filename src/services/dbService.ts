@@ -1,5 +1,76 @@
 import type { ImageMetadata } from "../types";
-import { compressImage, compressToDataUrl } from "../lib/utils";
+import { compressToDataUrl } from "../lib/utils";
+
+const AUTH_TOKEN_STORAGE_KEY = "lenslogic_token";
+const USER_STORAGE_KEY = "lenslogic_user";
+
+export function getAuthToken(): string | null {
+  try {
+    return localStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function setAuthToken(token: string | null) {
+  try {
+    if (token) {
+      localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
+    } else {
+      localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    }
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+export function getAuthHeaders(extra?: Record<string, string>): Record<string, string> {
+  const headers: Record<string, string> = { ...(extra || {}) };
+  const token = getAuthToken();
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+  return headers;
+}
+
+export async function ensureGuestSession(existingUid?: string): Promise<any> {
+  const res = await fetch(getApiUrl("/api/auth/guest"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(existingUid ? { uid: existingUid } : {})
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data?.error || "Failed to start guest session.");
+  }
+  const data = await res.json();
+  if (data?.token) {
+    setAuthToken(data.token);
+  }
+  if (data?.user) {
+    localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(data.user));
+  }
+  return data.user;
+}
+
+export async function verifyAuthSession(): Promise<any | null> {
+  const token = getAuthToken();
+  if (!token) return null;
+  try {
+    const res = await fetch(getApiUrl("/api/auth/me"), {
+      headers: getAuthHeaders()
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data?.user) {
+      localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(data.user));
+      return data.user;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
 
 // Helper to determine the backend API base URL
 export function getApiUrl(path: string): string {
@@ -24,29 +95,32 @@ export async function saveUserProfile(uid: string, email: string, data?: Partial
   savedSettings: any;
   role: "user" | "admin";
 }>) {
-  try {
-    const res = await fetch(getApiUrl("/api/users/update"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        uid,
-        email,
-        savedSettings: data?.savedSettings || null,
-        role: data?.role
-      })
-    });
-    if (!res.ok) {
-      throw new Error("Failed to update profile settings.");
-    }
-  } catch (err) {
-    console.error("saveUserProfile error:", err);
+  if (!getAuthToken()) {
+    return;
+  }
+  const payload: Record<string, any> = { uid, email };
+  if (data && "savedSettings" in data && data.savedSettings !== undefined) {
+    payload.savedSettings = data.savedSettings;
+  }
+  if (data?.role) {
+    payload.role = data.role;
+  }
+
+  const res = await fetch(getApiUrl("/api/users/update"), {
+    method: "POST",
+    headers: getAuthHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({}));
+    throw new Error(errBody?.error || "Failed to update profile settings.");
   }
 }
 
 // Fetch user profile (locally cached during login or retrieved if needed)
 export async function getUserProfile(uid: string) {
   try {
-    const saved = localStorage.getItem("lenslogic_user");
+    const saved = localStorage.getItem(USER_STORAGE_KEY);
     if (saved) {
       const parsed = JSON.parse(saved);
       if (parsed.uid === uid) {
@@ -62,6 +136,7 @@ export async function getUserProfile(uid: string) {
 // Save an asset to the Express custom database
 export async function saveAsset(asset: ImageMetadata, userId: string) {
   try {
+    if (!getAuthToken()) return;
     // Compress preview image to optimize transmission size
     let compressedPreview = asset.preview;
     if (asset.preview) {
@@ -98,7 +173,7 @@ export async function saveAsset(asset: ImageMetadata, userId: string) {
 
     const res = await fetch(getApiUrl("/api/assets"), {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: getAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(assetData)
     });
 
@@ -113,7 +188,10 @@ export async function saveAsset(asset: ImageMetadata, userId: string) {
 // Load all assets for a user
 export async function loadUserAssets(userId: string): Promise<ImageMetadata[]> {
   try {
-    const res = await fetch(getApiUrl(`/api/assets?userId=${encodeURIComponent(userId)}`));
+    if (!getAuthToken()) return [];
+    const res = await fetch(getApiUrl(`/api/assets?userId=${encodeURIComponent(userId)}`), {
+      headers: getAuthHeaders()
+    });
     if (!res.ok) {
       throw new Error("Failed to load assets.");
     }
@@ -141,8 +219,10 @@ export async function loadUserAssets(userId: string): Promise<ImageMetadata[]> {
 // Delete an asset from database
 export async function deleteAssetFromDb(assetId: string) {
   try {
+    if (!getAuthToken()) return;
     const res = await fetch(getApiUrl(`/api/assets/${encodeURIComponent(assetId)}`), {
-      method: "DELETE"
+      method: "DELETE",
+      headers: getAuthHeaders()
     });
     if (!res.ok) {
       throw new Error("Failed to delete asset.");
@@ -155,9 +235,10 @@ export async function deleteAssetFromDb(assetId: string) {
 // Clear all assets for a user from database
 export async function clearAllAssetsFromDb(userId: string) {
   try {
+    if (!getAuthToken()) return;
     const res = await fetch(getApiUrl("/api/assets/clear"), {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: getAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ userId })
     });
     if (!res.ok) {
@@ -170,28 +251,24 @@ export async function clearAllAssetsFromDb(userId: string) {
 
 // Admin function: Load all users
 export async function adminLoadAllUsers() {
-  try {
-    const res = await fetch(getApiUrl("/api/admin/users"));
-    if (!res.ok) {
-      throw new Error("Failed to load admin users.");
-    }
-    return await res.json();
-  } catch (err) {
-    console.error("adminLoadAllUsers error:", err);
-    return [];
+  const res = await fetch(getApiUrl("/api/admin/users"), {
+    headers: getAuthHeaders()
+  });
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({}));
+    throw new Error(errBody?.error || "Failed to load admin users.");
   }
+  return await res.json();
 }
 
 // Admin function: Load all assets for metrics
 export async function adminLoadAllAssets() {
-  try {
-    const res = await fetch(getApiUrl("/api/admin/assets"));
-    if (!res.ok) {
-      throw new Error("Failed to load admin assets.");
-    }
-    return await res.json();
-  } catch (err) {
-    console.error("adminLoadAllAssets error:", err);
-    return [];
+  const res = await fetch(getApiUrl("/api/admin/assets"), {
+    headers: getAuthHeaders()
+  });
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({}));
+    throw new Error(errBody?.error || "Failed to load admin assets.");
   }
+  return await res.json();
 }

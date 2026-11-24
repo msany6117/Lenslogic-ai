@@ -1,7 +1,7 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    
+
     function isValidId(id) {
       return id is string && id.size() > 0 && id.size() < 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
@@ -14,24 +14,62 @@ service cloud.firestore {
       return isAuth() && request.auth.uid == userId;
     }
 
+    function isBootstrapAdmin() {
+      return isAuth()
+        && request.auth.token.email != null
+        && request.auth.token.email.lower() == 'msany6117@gmail.com'
+        && request.auth.token.email_verified == true;
+    }
+
     function isAdmin() {
-      return isAuth() && 
-        exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
-        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+      return isBootstrapAdmin() || (
+        isAuth() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'
+      );
+    }
+
+    function isValidUserPayload(userId) {
+      return request.resource.data.keys().hasAll(['uid', 'email', 'role', 'createdAt'])
+        && request.resource.data.keys().hasOnly(['uid', 'email', 'role', 'savedApiKey', 'savedGroqKey', 'createdAt'])
+        && request.resource.data.uid == userId
+        && request.resource.data.email is string
+        && request.resource.data.email.size() <= 320
+        && request.resource.data.role in ['user', 'admin'];
+    }
+
+    function isValidAssetPayload(assetId) {
+      return request.resource.data.keys().hasAll(['id', 'userId', 'name', 'type', 'status', 'createdAt'])
+        && request.resource.data.keys().hasOnly(['id', 'userId', 'name', 'title', 'description', 'keywords', 'type', 'preview', 'status', 'errorMsg', 'createdAt'])
+        && request.resource.data.id == assetId
+        && request.resource.data.userId is string
+        && request.resource.data.name is string && request.resource.data.name.size() <= 500
+        && request.resource.data.type in ['Photo', 'Video', 'Vector', 'Illustration']
+        && request.resource.data.status in ['idle', 'processing', 'completed', 'error'];
     }
 
     match /users/{userId} {
-      allow read: if isOwner(userId) || isAdmin();
-      allow create: if isOwner(userId) && (request.resource.data.role == 'user' || (request.resource.data.role == 'admin' && (request.auth.token.email.lower() == 'msany6117@gmail.com' || request.resource.data.email.lower() == 'msany6117@gmail.com')));
-      allow update: if isOwner(userId) && (isAdmin() || (request.resource.data.role == resource.data.role)) || isAdmin();
-      allow delete: if isAdmin();
+      allow read: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow create: if isValidId(userId)
+        && isOwner(userId)
+        && isValidUserPayload(userId)
+        && (request.resource.data.role == 'user' || (request.resource.data.role == 'admin' && isBootstrapAdmin()));
+      allow update: if isValidId(userId)
+        && isValidUserPayload(userId)
+        && request.resource.data.uid == resource.data.uid
+        && ((isOwner(userId) && request.resource.data.role == resource.data.role) || isAdmin());
+      allow delete: if isValidId(userId) && isAdmin();
     }
 
     match /assets/{assetId} {
-      allow read: if isAuth() && (resource.data.userId == request.auth.uid || isAdmin());
-      allow create: if isAuth() && request.resource.data.userId == request.auth.uid;
-      allow update: if isAuth() && (resource.data.userId == request.auth.uid || isAdmin());
-      allow delete: if isAuth() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow read: if isValidId(assetId) && isAuth() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isValidId(assetId) && isAuth() && isValidAssetPayload(assetId) && request.resource.data.userId == request.auth.uid;
+      allow update: if isValidId(assetId) && isAuth() && isValidAssetPayload(assetId) && request.resource.data.userId == resource.data.userId && (resource.data.userId == request.auth.uid || isAdmin());
+      allow delete: if isValidId(assetId) && isAuth() && (resource.data.userId == request.auth.uid || isAdmin());
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
     }
   }
 }

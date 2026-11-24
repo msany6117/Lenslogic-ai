@@ -25,16 +25,21 @@ export default function AdminPanel() {
   const [assets, setAssets] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
 
   const loadData = async () => {
+    setLoadError(null);
     try {
-      const allUsers = await adminLoadAllUsers();
-      const allAssets = await adminLoadAllAssets();
-      setUsers(allUsers);
-      setAssets(allAssets);
-    } catch (e) {
+      const [allUsers, allAssets] = await Promise.all([
+        adminLoadAllUsers(),
+        adminLoadAllAssets(),
+      ]);
+      setUsers(Array.isArray(allUsers) ? allUsers : []);
+      setAssets(Array.isArray(allAssets) ? allAssets : []);
+    } catch (e: any) {
       console.error("Admin loaded error:", e);
+      setLoadError(e?.message || "Failed to load admin metrics.");
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -60,7 +65,6 @@ export default function AdminPanel() {
     setRoleError(null);
     try {
       await saveUserProfile(roleChangeTarget.user.uid, roleChangeTarget.user.email, {
-        savedSettings: roleChangeTarget.user.savedSettings,
         role: roleChangeTarget.newRole
       });
       // Update role locally in state
@@ -85,7 +89,7 @@ export default function AdminPanel() {
   // Aggregate stats
   const totalUsers = users.length;
   const totalAssets = assets.length;
-  const activeKeysCount = users.filter(u => u.savedApiKey || u.savedGroqKey).length;
+  const activeKeysCount = users.filter(u => Boolean(u.hasApiKeys || u.savedApiKey || u.savedGroqKey)).length;
 
   const typeCounts = { Photo: 0, Video: 0, Vector: 0, Illustration: 0 };
   const statusCounts = { idle: 0, processing: 0, completed: 0, error: 0 };
@@ -129,6 +133,22 @@ export default function AdminPanel() {
           Sync Live Data
         </button>
       </header>
+
+      {loadError && (
+        <div className="p-4 rounded-2xl bg-rose-50 border border-rose-200 text-rose-800 text-xs flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-rose-500 shrink-0" />
+            <span>{loadError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={handleRefresh}
+            className="px-3 py-1 bg-white border border-rose-200 rounded-lg font-semibold hover:bg-rose-100 cursor-pointer"
+          >
+            Retry
+          </button>
+        </div>
+      )}
 
       {/* Metrics Grid */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
@@ -251,7 +271,7 @@ export default function AdminPanel() {
               {filteredUsers.length > 0 ? (
                 filteredUsers.map((user, idx) => {
                   const userAssetsCount = assets.filter(a => a.userId === user.uid).length;
-                  const hasKeys = user.savedApiKey || user.savedGroqKey;
+                  const hasKeys = Boolean(user.hasApiKeys || user.savedApiKey || user.savedGroqKey);
                   return (
                     <tr key={user.uid || idx} className="hover:bg-slate-50/60 transition-colors">
                       <td className="p-4 text-xs font-semibold text-slate-900">{user.email || 'Guest'}</td>
@@ -274,7 +294,7 @@ export default function AdminPanel() {
                           {hasKeys ? (
                             <>
                               <CheckCircle2 className="w-3.5 h-3.5" />
-                              Active Keys
+                              {user.apiKeyCount ? `${user.apiKeyCount} Active` : 'Active Keys'}
                             </>
                           ) : 'No API Keys'}
                         </span>

@@ -1,36 +1,61 @@
 import type { GenerationSettings, ApiKeyEntry, AssetType } from "../types";
 import { compressImage } from "../lib/utils";
+import { getApiUrl } from "./dbService";
 
-export function buildSeoPrompt(settings: GenerationSettings, assetType: AssetType = 'Photo'): string {
+function getFormatLabel(fileExtension?: string, assetType: AssetType = 'Photo', isTransparent = false): { extUpper: string; phrase: string } {
+  const ext = (fileExtension || '').toLowerCase().replace(/^\./, '');
+  const extUpper = ext.toUpperCase();
+  if (ext === 'eps') return { extUpper: 'EPS', phrase: 'EPS vector illustration' };
+  if (ext === 'ai') return { extUpper: 'AI', phrase: 'AI vector illustration' };
+  if (ext === 'svg') return { extUpper: 'SVG', phrase: 'SVG vector graphic' };
+  if (ext === 'pdf') return { extUpper: 'PDF', phrase: 'PDF vector graphic' };
+  if (ext === 'png') return { extUpper: 'PNG', phrase: isTransparent ? 'transparent PNG' : 'PNG graphic' };
+  if (ext === 'jpg' || ext === 'jpeg') {
+    return { extUpper: 'JPG', phrase: assetType === 'Illustration' ? 'JPG illustration' : assetType === 'Vector' ? 'JPG vector graphic' : 'JPG photo' };
+  }
+  if (ext === 'webp') return { extUpper: 'WEBP', phrase: isTransparent ? 'transparent WebP graphic' : 'WebP image' };
+  if (['mp4', 'mov', 'avi', 'mkv', 'webm', 'mpg'].includes(ext)) return { extUpper: extUpper || 'MP4', phrase: `${extUpper || 'MP4'} stock video` };
+  if (assetType === 'Vector') return { extUpper: 'VECTOR', phrase: 'vector illustration' };
+  if (assetType === 'Illustration') return { extUpper: 'ILLUSTRATION', phrase: 'digital illustration' };
+  if (assetType === 'Video') return { extUpper: 'VIDEO', phrase: 'stock video footage' };
+  return { extUpper: extUpper || 'PHOTO', phrase: 'stock photo' };
+}
+
+export function buildSeoPrompt(settings: GenerationSettings, assetType: AssetType = 'Photo', fileExtension?: string): string {
+  const isTransparent = Boolean(settings.transparentBackground);
+  const { extUpper, phrase } = getFormatLabel(fileExtension, assetType, isTransparent);
+
   return `
-    You are a world-class Stock Content SEO Expert. 
-    Analyze the provided image and generate metadata optimized specifically for ${settings.platform}.
-    
-    Asset Context:
-    - Target Platform: ${settings.platform}
-    - Asset Type: ${assetType}
-    - Platform Rules: ${settings.platform === 'Adobe Stock' ? 'Focus on commercial appeal, avoid numbers/camera info in title.' : ''}
-    ${settings.platform === 'Shutterstock' ? 'Requires descriptive titles, keywords should be noun/adjective heavy.' : ''}
-    ${settings.platform === 'Freepik' ? 'Highly descriptive, focus on use-case and design elements.' : ''}
-    ${settings.platform === 'Getty Images' ? 'Editorial or commercial clarity, precise keywords.' : ''}
-    - Title Length: ${settings.titleLength} characters.
-    - Keyword Count: Exactly ${settings.keywordCount} keywords.
-    - PNG / Transparent Background Rule:
-      Check if the image has a transparent background (as is common with PNGs/vectors/graphics/isolated illustrations). If the background is transparent, describe it as "isolated on a transparent background", "transparent PNG", or "isolated graphic". Do NOT mention "white background" or "isolated on white" if the background is actually transparent. Only describe it as "white background" or "isolated on white" if there is a solid white background.
-    - Asset specific instruction: 
-      ${assetType === 'Vector' ? 'Focus on technical execution, usage as a design asset (SVG/EPS), and scalability. Mention "vector", "illustration", and specific design styles (flat, isometric, etc.).' : ''} 
-      ${assetType === 'Illustration' ? 'Focus on artistic style, mood, and digital/hand-drawn textures. Use descriptive adjectives (watercolor, charcoal, digital art).' : ''}
-      ${assetType === 'Video' ? 'Focus on motion, camera movement (pan, tilt, zoom), lighting, and the "story" captured in the clip. This is for stock footage SEO.' : ''}
-    - Keywords must be: SEO optimized, comma-separated, high-traffic terms, excluding stop words.
-    - Prefix: ${settings.prefix || 'None'}
-    - Suffix: ${settings.suffix || 'None'}
-    - Prohibited Terms (Exclude these): ${settings.negativeKeywords || 'None'}
+    You are an elite Stock Marketplace SEO Strategist who ranks assets #1 on ${settings.platform}, Shutterstock, and Freepik for maximum contributor downloads.
+    Analyze the image carefully and generate ultra-high-converting, buyer-intent metadata.
 
-    Output Requirements:
-    - Return ONLY a raw JSON object string.
-    - "title": A powerful, SEO-driven title based on image content and platform rules.
-    - "description": A clear, semantic description for search engine indexing.
-    - "keywords": A flat array of ${settings.keywordCount} strings.
+    Asset Context:
+    - Target Marketplace: ${settings.platform}
+    - Asset Type: ${assetType}
+    - File Format: ${extUpper} (${phrase})
+    - Title Length Target: ${settings.titleLength} characters (strictly respect this length window).
+    - Keyword Count: Exactly ${settings.keywordCount} keywords.
+    - Transparent Background Mode: ${isTransparent ? 'ENABLED (MANDATORY)' : 'AUTO-DETECT'}
+
+    Title SEO Rules (CRITICAL for top search ranking & downloads):
+    1. Front-load the most-searched primary subject, action, and commercial concept in the FIRST 50 characters.
+    2. ALWAYS naturally include the asset/file format (${extUpper} / ${phrase}) inside the title so buyers filtering or searching for "${extUpper}" or "${assetType.toLowerCase()}" find this asset immediately.
+    3. Include visual style, mood, composition, or commercial use-case without robotic repetition.
+    ${isTransparent
+      ? `4. TRANSPARENT RULE (STRICT): This file has a transparent background. You MUST explicitly include "transparent" or "isolated on transparent background" in the title. NEVER write "white background", "on white", "isolated on white", or "white backdrop" anywhere in the title, description, or keywords.`
+      : `4. Background Rule: Only describe a white background if it is visibly solid white; if isolated or transparent, state "isolated on transparent background" or "isolated graphic".`}
+    ${settings.prefix ? `5. Title Prefix context: Start naturally with or accommodate prefix "${settings.prefix}".` : ''}
+    ${settings.suffix ? `6. Title Suffix context: End naturally with or accommodate suffix "${settings.suffix}".` : ''}
+
+    Keyword SEO Rules (Ordered strictly by search weight — strongest 10 keywords FIRST):
+    1. Top 10 keywords MUST be the highest-volume exact-match subject, style, and main commercial concept terms.
+    2. Remaining keywords MUST blend high-converting buyer-intent phrases, commercial use-cases, color/mood/lighting descriptors, and format/asset tags (${extUpper.toLowerCase()}, ${assetType.toLowerCase()}).
+    ${isTransparent
+      ? `3. TRANSPARENT & PNG KEYWORDS REQUIRED: Include high-traffic transparent keywords ("transparent", "transparent background", "png", "isolated", "cutout", "no background", "alpha channel") among the keywords. Exclude any "white background" keywords.`
+      : ''}
+    4. Exclude weak filler words ("nice", "good", "file", "picture"), duplicates, and prohibited terms: ${settings.negativeKeywords || 'None'}.
+
+    Output strictly valid JSON with keys: "title", "description", "keywords" (array of ${settings.keywordCount} unique SEO keywords).
   `;
 }
 
@@ -38,55 +63,164 @@ export async function generateMetadata(
   base64Image: string,
   settings: GenerationSettings,
   activeKey: ApiKeyEntry | null,
-  assetType: AssetType = 'Photo'
+  assetType: AssetType = 'Photo',
+  fileExtension?: string
 ): Promise<{ title: string; description: string; keywords: string[] }> {
   
-  // Compress image to a highly optimized standard size (max 512px) right at the start.
-  // This reduces payload size by ~99% (sub-second network transfer).
+  // Skip redundant re-compression only when caller already compressed image to a compact raster JPEG/PNG/WebP data URL
   let optimizedBase64 = base64Image;
-  try {
-    optimizedBase64 = await compressImage(base64Image, 512, 512, 0.75);
-  } catch (err) {
-    console.warn("Failed to compress image for AI service, sending original:", err);
+  const isCompactRasterDataUrl = /^data:image\/(jpeg|png|webp);base64,/i.test(base64Image) && base64Image.length < 150000;
+  if (!isCompactRasterDataUrl) {
+    try {
+      const compressed = await compressImage(base64Image, 384, 384, 0.68);
+      if (compressed) {
+        optimizedBase64 = compressed;
+      }
+    } catch (err) {
+      console.warn("Failed to compress image for AI service, sending original:", err);
+    }
   }
 
-  const prompt = buildSeoPrompt(settings, assetType);
+  if (!/^data:image\/(jpeg|png|webp|heic|heif);base64,[A-Za-z0-9+/=]{16,}/i.test(optimizedBase64)) {
+    throw new Error("Could not encode image preview for AI analysis. Please attach a valid JPG or PNG preview.");
+  }
 
   // If the user explicitly has a Groq key active, use Groq provider directly
-  if (activeKey && activeKey.provider === 'Groq' && activeKey.key) {
-    return await callGroq(optimizedBase64, prompt, activeKey.key, settings);
+  if (activeKey && activeKey.provider === 'Groq' && activeKey.key?.trim()) {
+    const prompt = buildSeoPrompt(settings, assetType, fileExtension);
+    return await callGroq(optimizedBase64, prompt, activeKey.key.trim(), settings, assetType, fileExtension);
   }
 
-  // All Gemini AI operations are handled on the server via /api/generate-metadata
-  const geminiKey = (activeKey?.provider === 'Gemini' ? activeKey.key : null) || 
-                    settings.apiKeys?.find(k => k.provider === 'Gemini' && k.key)?.key || undefined;
+  // Collect user-provided Gemini API keys (active key first)
+  const orderedGeminiKeys: string[] = [];
+  if (activeKey?.provider === 'Gemini' && activeKey.key?.trim()) {
+    orderedGeminiKeys.push(activeKey.key.trim());
+  }
+  for (const entry of settings.apiKeys || []) {
+    const trimmed = entry?.provider === 'Gemini' ? entry.key?.trim() : '';
+    if (trimmed && !orderedGeminiKeys.includes(trimmed)) {
+      orderedGeminiKeys.push(trimmed);
+    }
+  }
+  if (orderedGeminiKeys.length === 0) {
+    const fallbackGroq = (settings.apiKeys || []).find((k) => k?.provider === 'Groq' && k.key?.trim());
+    if (fallbackGroq?.key?.trim()) {
+      const prompt = buildSeoPrompt(settings, assetType, fileExtension);
+      return await callGroq(optimizedBase64, prompt, fallbackGroq.key.trim(), settings, assetType, fileExtension);
+    }
+    throw new Error("API key required. Please add your Gemini or Groq API key in AI Configuration.");
+  }
 
-  const response = await fetch("/api/generate-metadata", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
+  const requestMetadataFromServer = async (geminiKey: string) => {
+    const payload = JSON.stringify({
       base64Image: optimizedBase64,
       settings,
       apiKey: geminiKey,
-      assetType
-    })
-  });
+      assetType,
+      fileExtension
+    });
 
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}));
-    const errorMessage = errorData.error || `Server generation failed (Status: ${response.status})`;
-    throw new Error(errorMessage);
+    const primaryUrl = getApiUrl("/api/generate-metadata");
+    const candidateUrls = primaryUrl !== "/api/generate-metadata"
+      ? [primaryUrl, "/api/generate-metadata"]
+      : [primaryUrl];
+
+    let lastFetchErr: Error | null = null;
+
+    for (let idx = 0; idx < candidateUrls.length; idx++) {
+      const targetUrl = candidateUrls[idx];
+      let response: Response;
+      try {
+        response = await fetch(targetUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: payload
+        });
+      } catch (networkErr: any) {
+        lastFetchErr = networkErr instanceof Error ? networkErr : new Error("Network request failed");
+        continue;
+      }
+
+      const contentType = (response.headers.get("content-type") || "").toLowerCase();
+      const rawBody = await response.text();
+      let parsedBody: any = null;
+      if (rawBody) {
+        try {
+          parsedBody = JSON.parse(rawBody);
+        } catch {
+          parsedBody = null;
+        }
+      }
+
+      const isHtml = contentType.includes("text/html") || /^\s*<!doctype|^\s*<html/i.test(rawBody);
+      if (isHtml && idx < candidateUrls.length - 1) {
+        // Stale custom API URL returned HTML; retry on same-origin /api/generate-metadata
+        continue;
+      }
+
+      if (!response.ok) {
+        const errorMessage =
+          parsedBody?.error ||
+          (isHtml
+            ? `Server returned an HTML error page (HTTP ${response.status}). Please retry in a moment.`
+            : `Server generation failed (Status: ${response.status})`);
+        const err = new Error(errorMessage) as Error & { status?: number };
+        err.status = response.status;
+        throw err;
+      }
+
+      if (!parsedBody) {
+        throw new Error(
+          isHtml
+            ? "Metadata API endpoint returned HTML instead of JSON. Please refresh or ensure the backend server is running."
+            : "Invalid non-JSON response received from server metadata engine."
+        );
+      }
+
+      if (!parsedBody.title || !Array.isArray(parsedBody.keywords)) {
+        throw new Error("Invalid output received from server metadata engine.");
+      }
+
+      return parseAndPolish(JSON.stringify(parsedBody), settings, assetType, fileExtension);
+    }
+
+    throw lastFetchErr || new Error("Failed to reach metadata API endpoint.");
+  };
+
+  let lastKeyError: any = null;
+  for (let i = 0; i < orderedGeminiKeys.length; i++) {
+    try {
+      return await requestMetadataFromServer(orderedGeminiKeys[i]);
+    } catch (err: any) {
+      lastKeyError = err;
+      const status = Number(err?.status || 0);
+      const msg = String(err?.message || '').toLowerCase();
+      const isRetryableWithNextKey =
+        status === 429 ||
+        status === 503 ||
+        status === 401 ||
+        status === 403 ||
+        msg.includes('429') ||
+        msg.includes('503') ||
+        msg.includes('quota') ||
+        msg.includes('busy');
+      if (!isRetryableWithNextKey || i === orderedGeminiKeys.length - 1) {
+        throw err;
+      }
+    }
   }
 
-  const serverResult = await response.json();
-  if (!serverResult || !serverResult.title || !Array.isArray(serverResult.keywords)) {
-    throw new Error("Invalid output received from server metadata engine.");
-  }
-
-  return parseAndPolish(JSON.stringify(serverResult), settings);
+  throw lastKeyError || new Error("Metadata generation failed.");
 }
 
-async function callGroq(base64Image: string, prompt: string, apiKey: string, settings: GenerationSettings) {
+async function callGroq(
+  base64Image: string,
+  prompt: string,
+  apiKey: string,
+  settings: GenerationSettings,
+  assetType: AssetType = 'Photo',
+  fileExtension?: string
+) {
   // Compress the image specifically for Groq to guarantee it fits under Groq's payload limit (avoid "Request Entity Too Large" errors)
   let compressedForGroq = base64Image;
   try {
@@ -95,10 +229,10 @@ async function callGroq(base64Image: string, prompt: string, apiKey: string, set
     console.warn("Failed to compress image specifically for Groq:", err);
   }
 
-  // Robust list of active Groq vision models to try
+  // Active Groq multimodal vision models
   const candidateModels = [
-    "llama-3.2-90b-vision-instruct",
-    "llama-3.2-11b-vision-preview"
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct"
   ];
   
   let lastError: any = null;
@@ -132,18 +266,30 @@ async function callGroq(base64Image: string, prompt: string, apiKey: string, set
         })
       });
 
-      if (!response.ok) {
-        const errorBody = await response.json().catch(() => ({}));
-        throw new Error(errorBody?.error?.message || response.statusText || `HTTP ${response.status}`);
+      const rawText = await response.text();
+      let result: any = null;
+      if (rawText) {
+        try {
+          result = JSON.parse(rawText);
+        } catch {
+          result = null;
+        }
       }
 
-      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result?.error?.message || response.statusText || `HTTP ${response.status}`);
+      }
+
+      if (!result) {
+        throw new Error("Groq returned a non-JSON response. Please try again.");
+      }
+
       const content = result.choices?.[0]?.message?.content;
       if (!content) {
         throw new Error("No response content from Groq");
       }
       
-      return parseAndPolish(content, settings);
+      return parseAndPolish(content, settings, assetType, fileExtension);
     } catch (error: any) {
       lastError = error;
       const errMsg = String(error?.message || "").toUpperCase();
@@ -300,7 +446,12 @@ function parseWithRegexFallback(text: string) {
   return { title, description, keywords };
 }
 
-function parseAndPolish(text: string, settings: GenerationSettings) {
+function parseAndPolish(
+  text: string,
+  settings: GenerationSettings,
+  assetType: AssetType = 'Photo',
+  fileExtension?: string
+) {
   let metadata: any;
   
   try {
@@ -336,6 +487,70 @@ function parseAndPolish(text: string, settings: GenerationSettings) {
     .map((k: any) => String(k).trim())
     .filter((k: string) => k.length > 0 && !k.includes('"') && !k.includes('\\'));
 
+  const isTransparent = Boolean(settings.transparentBackground);
+  const { extUpper } = getFormatLabel(fileExtension, assetType, isTransparent);
+
+  if (isTransparent) {
+    const stripWhiteBg = (txt: string) =>
+      txt
+        .replace(/\b(?:isolated\s+)?on\s+(?:a\s+|an\s+)?(?:clean\s+|pure\s+|solid\s+)?white\s+background\b/gi, 'on transparent background')
+        .replace(/\bisolated\s+on\s+white\b/gi, 'isolated on transparent background')
+        .replace(/\b(?:pure\s+|solid\s+)?white\s+background\b/gi, 'transparent background')
+        .replace(/\bwhite\s+backdrop\b/gi, 'transparent background')
+        .replace(/\s{2,}/g, ' ')
+        .replace(/\s+,/g, ',')
+        .trim();
+
+    metadata.title = stripWhiteBg(metadata.title);
+    metadata.description = stripWhiteBg(metadata.description);
+
+    if (!/\btransparent\b/i.test(metadata.title)) {
+      metadata.title = `${metadata.title}, Isolated on Transparent Background`;
+    }
+
+    metadata.keywords = metadata.keywords.filter(
+      (k: string) => !/\bwhite\s*(background|backdrop)\b|^on white$|^isolated on white$/i.test(k)
+    );
+
+    const requiredTransparentTags = ['transparent', 'transparent background', 'png', 'isolated', 'cutout', 'no background'];
+    const existingLower = new Set(metadata.keywords.map((k: string) => k.toLowerCase()));
+    const missingTags = requiredTransparentTags.filter((t) => !existingLower.has(t));
+    if (missingTags.length > 0 && settings.keywordCount) {
+      const keepCount = Math.max(0, settings.keywordCount - missingTags.length);
+      metadata.keywords = [...metadata.keywords.slice(0, keepCount), ...missingTags];
+    }
+  }
+
+  // Ensure uploaded file format is reflected in title if missing
+  if (extUpper && extUpper !== 'PHOTO' && extUpper !== 'ILLUSTRATION' && extUpper !== 'VIDEO') {
+    const extRegex = new RegExp(`\\b${extUpper}\\b`, 'i');
+    if (!extRegex.test(metadata.title)) {
+      if (extUpper === 'EPS' || extUpper === 'AI' || extUpper === 'SVG') {
+        metadata.title = /\bvector\b/i.test(metadata.title)
+          ? metadata.title.replace(/\bvector\b/i, `${extUpper} Vector`)
+          : `${metadata.title} ${extUpper} Vector`;
+      } else {
+        metadata.title = `${metadata.title} ${extUpper}`;
+      }
+    }
+  } else if (assetType === 'Vector' && !/\bvector\b/i.test(metadata.title)) {
+    metadata.title = `${metadata.title} Vector`;
+  }
+
+  // Filter duplicates and negative keywords
+  const negList = String(settings.negativeKeywords || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  const seen = new Set<string>();
+  metadata.keywords = metadata.keywords.filter((k: string) => {
+    const lower = k.toLowerCase();
+    if (seen.has(lower)) return false;
+    if (negList.some((neg) => lower.includes(neg))) return false;
+    seen.add(lower);
+    return true;
+  });
+
   // Ensure exact keyword count
   if (settings.keywordCount && metadata.keywords.length > 0) {
     if (metadata.keywords.length > settings.keywordCount) {
@@ -344,11 +559,11 @@ function parseAndPolish(text: string, settings: GenerationSettings) {
   }
 
   // Final polishing
-  if (settings.prefix && !metadata.title.startsWith(settings.prefix)) {
-    metadata.title = `${settings.prefix} ${metadata.title}`;
+  if (settings.prefix && !metadata.title.toLowerCase().startsWith(settings.prefix.trim().toLowerCase())) {
+    metadata.title = `${settings.prefix.trim()} ${metadata.title}`;
   }
-  if (settings.suffix && !metadata.title.endsWith(settings.suffix)) {
-    metadata.title = `${metadata.title} ${settings.suffix}`;
+  if (settings.suffix && !metadata.title.toLowerCase().endsWith(settings.suffix.trim().toLowerCase())) {
+    metadata.title = `${metadata.title} ${settings.suffix.trim()}`;
   }
 
   return metadata;

@@ -1,4 +1,4 @@
-import React, { useState, useCallback, type ReactNode } from 'react';
+import React, { useState, useCallback, useRef, useEffect, type ReactNode } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Upload, 
@@ -8,41 +8,33 @@ import {
   Download, 
   RefreshCw, 
   Trash2, 
-  CheckCircle2, 
   AlertCircle,
   Copy,
-  LayoutDashboard,
   Search,
   Check,
   Video as VideoIcon,
   Key,
   Shield,
-  LogOut,
   RotateCcw,
   Sparkles,
   Layers,
-  Sliders
+  Sliders,
+  Cpu,
+  Eye,
+  EyeOff
 } from 'lucide-react';
-import { useDropzone, type Accept } from 'react-dropzone';
+import { useDropzone } from 'react-dropzone';
 import Papa from 'papaparse';
 import { cn, compressToDataUrl } from './lib/utils';
 import { generateMetadata as generateMetadataService } from './services/aiService';
-import type { Platform, GenerationSettings, ImageMetadata, ApiResponse, AssetType } from './types';
+import { loadVectorPreview } from './services/vectorService';
+import type { GenerationSettings, ImageMetadata, AssetType } from './types';
 
-// Firebase Integrations
-import { 
-  saveUserProfile, 
-  getUserProfile, 
-  deleteAssetFromDb,
-  clearAllAssetsFromDb
-} from './services/dbService';
+import { saveUserProfile, getApiUrl } from './services/dbService';
 import AuthScreen from './components/AuthScreen';
 import AdminPanel from './components/AdminPanel';
 import FreepikConverter from './components/FreepikConverter';
-
-const PLATFORMS: Platform[] = ['Adobe Stock', 'Shutterstock', 'Freepik', 'Getty Images', 'Draft'];
-
-const dropzoneAccept: Accept = { 'image/*': [] };
+import BgStudio from './components/BgStudio';
 
 export default function App() {
   const [user, setUser] = useState<any>(null);
@@ -52,37 +44,53 @@ export default function App() {
   const [images, setImages] = useState<ImageMetadata[]>([]);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
-  const [activeTab, setActiveTab] = useState<'metadata' | 'studio' | 'settings' | 'admin'>('metadata');
+  const [activeTab, setActiveTab] = useState<'metadata' | 'studio' | 'techbg' | 'settings' | 'admin'>('metadata');
   const [isProcessingAll, setIsProcessingAll] = useState(false);
   const [batchProgress, setBatchProgress] = useState<{ total: number; completed: number; currentName: string; isRateLimited: boolean } | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
-  const [filterType, setFilterType] = useState<string>('All');
+  const [filterType, setFilterType] = useState<string>('all');
+  const [visibleKeyIds, setVisibleKeyIds] = useState<Record<string, boolean>>({});
+  const imagesRef = useRef<ImageMetadata[]>(images);
+  imagesRef.current = images;
 
-  const [settings, setSettings] = useState<GenerationSettings>(() => {
-    const saved = localStorage.getItem('lenslogic_settings');
-    if (saved) {
-      const parsed = JSON.parse(saved);
-      if (!Array.isArray(parsed.apiKeys) || (parsed.apiKeys.length > 0 && typeof parsed.apiKeys[0] === 'string')) {
-        parsed.apiKeys = [];
-        parsed.activeKeyId = null;
-      }
-      return {
-        ...parsed,
-        batchSpeed: parsed.batchSpeed || 'safe'
-      };
-    }
-    return {
+  const normalizeSettings = (raw: any): GenerationSettings => {
+    const base: GenerationSettings = {
       platform: 'Adobe Stock',
       titleLength: '20-200',
       keywordCount: 30,
       prefix: '',
       suffix: '',
       negativeKeywords: '',
+      transparentBackground: false,
       apiKeys: [],
       activeKeyId: null,
       batchSpeed: 'safe'
     };
+    if (!raw || typeof raw !== 'object') return base;
+    const validKeys = Array.isArray(raw.apiKeys) && !(raw.apiKeys.length > 0 && typeof raw.apiKeys[0] === 'string')
+      ? raw.apiKeys
+      : [];
+    return {
+      ...base,
+      ...raw,
+      apiKeys: validKeys,
+      activeKeyId: validKeys.some((k: any) => k.id === raw.activeKeyId) ? raw.activeKeyId : (validKeys[0]?.id || null),
+      transparentBackground: Boolean(raw.transparentBackground),
+      batchSpeed: raw.batchSpeed === 'turbo' ? 'turbo' : 'safe'
+    };
+  };
+
+  const [settings, setSettings] = useState<GenerationSettings>(() => {
+    try {
+      const saved = localStorage.getItem('lenslogic_settings');
+      if (saved) {
+        return normalizeSettings(JSON.parse(saved));
+      }
+    } catch {}
+    return normalizeSettings(null);
   });
+  const settingsRef = useRef<GenerationSettings>(settings);
+  settingsRef.current = settings;
 
   // Check auth state on mount and sync assets
   React.useEffect(() => {
@@ -109,7 +117,7 @@ export default function App() {
           setUserProfile(currentUser);
           
           if (currentUser.savedSettings) {
-            setSettings(currentUser.savedSettings);
+            setSettings(normalizeSettings(currentUser.savedSettings));
           }
         } catch (e) {
           console.error("Error restoring session:", e);
@@ -120,23 +128,37 @@ export default function App() {
     initAuth();
   }, []);
 
-  // Sync settings and API Keys to backend and localStorage
-  React.useEffect(() => {
+  // Revoke any remaining blob URLs on unmount
+  useEffect(() => {
+    return () => {
+      imagesRef.current.forEach((img) => {
+        if (img.preview && img.preview.startsWith('blob:')) {
+          URL.revokeObjectURL(img.preview);
+        }
+      });
+    };
+  }, []);
+
+  // Sync settings to localStorage immediately and debounce network profile save
+  useEffect(() => {
     localStorage.setItem('lenslogic_settings', JSON.stringify(settings));
-    if (user) {
+    if (!user) return;
+
+    const updatedUser = { ...user, savedSettings: settings };
+    localStorage.setItem('lenslogic_user', JSON.stringify(updatedUser));
+
+    const timer = setTimeout(() => {
       const geminiKey = settings.apiKeys.find(k => k.provider === 'Gemini')?.key || '';
       const groqKey = settings.apiKeys.find(k => k.provider === 'Groq')?.key || '';
-      
+
       saveUserProfile(user.uid, user.email || '', {
         savedApiKey: geminiKey,
         savedGroqKey: groqKey,
         savedSettings: settings
       }).catch(err => console.error("Error saving profile settings:", err));
+    }, 600);
 
-      // Sync settings with cached user object in localStorage
-      const updatedUser = { ...user, savedSettings: settings };
-      localStorage.setItem('lenslogic_user', JSON.stringify(updatedUser));
-    }
+    return () => clearTimeout(timer);
   }, [settings, user]);
 
   const handleSignOut = () => {
@@ -163,15 +185,12 @@ export default function App() {
 
   // File Upload Handling
   const onDrop = useCallback((acceptedFiles: File[]) => {
-    const filesToProcess = acceptedFiles; // Lifted 100-file limit!
-
-    // Create a map to find reference images (JPG/PNG/WebP)
-    const fileMap = new Map<string, File>();
-    acceptedFiles.forEach(f => fileMap.set(f.name.toLowerCase(), f));
+    const filesToProcess = acceptedFiles;
 
     const processFiles = async () => {
       const newAssets: ImageMetadata[] = [];
-      const referenceImagesFound = new Map<string, string>();
+      const referencePreviewCache = new Map<string, string>();
+      const referenceFilesFound = new Map<string, File>();
 
       // Handle normalizing filename for cross-referencing
       const normalize = (name: string) => {
@@ -184,17 +203,26 @@ export default function App() {
         return base.toLowerCase().replace(/[^a-z0-9]/g, '');
       };
 
-      // First pass: identify all potential reference images in this batch
+      // Index raster files without eagerly allocating unused blob URLs
       acceptedFiles.forEach(f => {
         const ext = f.name.split('.').pop()?.toLowerCase();
         if (['jpg', 'jpeg', 'png', 'webp'].includes(ext || '')) {
-          referenceImagesFound.set(normalize(f.name), URL.createObjectURL(f));
+          referenceFilesFound.set(normalize(f.name), f);
         }
       });
 
+      const getRefUrl = (normBase: string): string | undefined => {
+        if (referencePreviewCache.has(normBase)) return referencePreviewCache.get(normBase);
+        const refFile = referenceFilesFound.get(normBase);
+        if (!refFile) return undefined;
+        const url = URL.createObjectURL(refFile);
+        referencePreviewCache.set(normBase, url);
+        return url;
+      };
+
       // Also index existing images in state to match against newly dropped vectors
       const existingRefs = new Map<string, string>();
-      images.forEach(img => {
+      imagesRef.current.forEach(img => {
         const imgName = img.file?.name || img.fileName || '';
         const ext = imgName.split('.').pop()?.toLowerCase();
         if (['jpg', 'jpeg', 'png', 'webp'].includes(ext || '') && img.preview) {
@@ -202,7 +230,7 @@ export default function App() {
         }
       });
 
-      for (const file of filesToProcess) {
+      const processSingleFile = async (file: File): Promise<ImageMetadata> => {
         const fileName = file.name;
         const extension = fileName.split('.').pop()?.toLowerCase();
         
@@ -221,9 +249,12 @@ export default function App() {
         // Try to find a reference image (JPG/PNG) for this asset
         let preview = '';
         const normBase = normalize(fileName);
-        const foundPreview = referenceImagesFound.get(normBase) || existingRefs.get(normBase);
+        const foundPreview =
+          (type === 'Video' || (type === 'Vector' && extension !== 'svg'))
+            ? (getRefUrl(normBase) || existingRefs.get(normBase))
+            : undefined;
 
-        if (foundPreview && (type === 'Video' || (type === 'Vector' && extension !== 'svg'))) {
+        if (foundPreview) {
           preview = foundPreview;
         } else if (extension === 'svg') {
           try {
@@ -233,41 +264,91 @@ export default function App() {
                 const img = new Image();
                 img.onload = () => {
                   const canvas = document.createElement('canvas');
-                  canvas.width = img.width || 1024;
-                  canvas.height = img.height || 1024;
-                  canvas.getContext('2d')?.drawImage(img, 0, 0, canvas.width, canvas.height);
-                  resolve(canvas.toDataURL('image/png'));
+                  canvas.width = Math.max(1, img.naturalWidth || img.width || 1024);
+                  canvas.height = Math.max(1, img.naturalHeight || img.height || 1024);
+                  const ctx = canvas.getContext('2d');
+                  if (ctx) {
+                    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                    try {
+                      const pngUrl = canvas.toDataURL('image/png');
+                      resolve(pngUrl.startsWith('data:image/png') ? pngUrl : URL.createObjectURL(file));
+                      return;
+                    } catch {
+                      // fallback below
+                    }
+                  }
+                  resolve(URL.createObjectURL(file));
                 };
+                img.onerror = () => resolve(URL.createObjectURL(file));
                 img.src = e.target?.result as string;
               };
+              reader.onerror = () => resolve(URL.createObjectURL(file));
               reader.readAsDataURL(file);
             });
-          } catch (e) {
+          } catch {
             preview = URL.createObjectURL(file);
           }
-        } else if (type === 'Video' && !foundPreview) {
+        } else if (type === 'Video') {
           try {
             preview = await new Promise((resolve) => {
               const video = document.createElement('video');
               const url = URL.createObjectURL(file);
-              video.src = url;
-              video.onloadeddata = () => video.currentTime = 1;
-              video.onseeked = () => {
-                const canvas = document.createElement('canvas');
-                canvas.width = video.videoWidth;
-                canvas.height = video.videoHeight;
-                canvas.getContext('2d')?.drawImage(video, 0, 0);
+              let settled = false;
+              const finish = (res: string) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
                 URL.revokeObjectURL(url);
-                resolve(canvas.toDataURL('image/jpeg', 0.8));
+                resolve(res);
               };
-              video.onerror = () => { URL.revokeObjectURL(url); resolve(''); };
+              const captureFrame = () => {
+                try {
+                  const canvas = document.createElement('canvas');
+                  canvas.width = Math.max(1, video.videoWidth || 640);
+                  canvas.height = Math.max(1, video.videoHeight || 360);
+                  canvas.getContext('2d')?.drawImage(video, 0, 0, canvas.width, canvas.height);
+                  const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+                  finish(dataUrl.startsWith('data:image/jpeg') ? dataUrl : '');
+                } catch {
+                  finish('');
+                }
+              };
+              const timer = setTimeout(() => {
+                if (video.readyState >= 2) captureFrame();
+                else finish('');
+              }, 6000);
+              video.muted = true;
+              video.playsInline = true;
+              video.preload = 'auto';
+              video.onloadeddata = () => {
+                const target = video.duration && isFinite(video.duration) ? Math.min(1, video.duration / 2) : 0;
+                if (target > 0.05) {
+                  video.currentTime = target;
+                } else {
+                  captureFrame();
+                }
+              };
+              video.onseeked = captureFrame;
+              video.onerror = () => finish('');
+              video.src = url;
             });
-          } catch (e) { console.warn('Video frame extraction failed'); }
-        } else if (!['eps', 'ai', 'pdf'].includes(extension || '')) {
-          preview = URL.createObjectURL(file);
+          } catch { console.warn('Video frame extraction failed'); }
+        } else if (['eps', 'ai', 'pdf'].includes(extension || '')) {
+          try {
+            const previewInfo = await loadVectorPreview(file, { maxDimension: 1024 });
+            if (!previewInfo.isPlaceholder && previewInfo.previewUrl) {
+              preview = previewInfo.previewUrl;
+            }
+          } catch (e) {
+            console.warn(`Auto preview extraction failed for ${fileName}:`, e);
+          }
+        } else {
+          // Reuse cached blob URL if already created as a reference for a sibling vector/video
+          preview = referencePreviewCache.get(normBase) || URL.createObjectURL(file);
+          referencePreviewCache.set(normBase, preview);
         }
 
-        newAssets.push({
+        return {
           id: Math.random().toString(36).substring(7),
           file,
           fileName,
@@ -279,7 +360,14 @@ export default function App() {
           keywords: [],
           status: 'idle',
           createdAt: new Date().toISOString()
-        });
+        };
+      };
+
+      const CONCURRENCY = 4;
+      for (let i = 0; i < filesToProcess.length; i += CONCURRENCY) {
+        const chunk = filesToProcess.slice(i, i + CONCURRENCY);
+        const processed = await Promise.all(chunk.map(processSingleFile));
+        newAssets.push(...processed);
       }
 
       // Update React state first so UI switches tabs and renders new elements instantly!
@@ -288,7 +376,7 @@ export default function App() {
           const imgName = img.file?.name || img.fileName || '';
           if (!img.preview && (img.type === 'Video' || (img.type === 'Vector' && !imgName.toLowerCase().endsWith('.svg')))) {
             const normBase = normalize(imgName);
-            const newRef = referenceImagesFound.get(normBase);
+            const newRef = getRefUrl(normBase);
             if (newRef) {
               return { 
                 ...img, 
@@ -304,7 +392,7 @@ export default function App() {
     };
 
     processFiles();
-  }, [images]);
+  }, [user?.uid]);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
@@ -312,13 +400,17 @@ export default function App() {
       'image/*': ['.jpg', '.jpeg', '.png', '.webp', '.svg'],
       'video/*': ['.mp4', '.mov', '.avi', '.webm'],
       'application/postscript': ['.eps', '.ai'],
+      'application/eps': ['.eps'],
+      'application/x-eps': ['.eps'],
+      'image/eps': ['.eps'],
+      'image/x-eps': ['.eps'],
       'application/pdf': ['.pdf']
     } as any,
     multiple: true
   } as any);
 
   // Metadata Generation Logic
-  const generateMetadata = async (image: ImageMetadata) => {
+  const generateMetadata = async (image: ImageMetadata): Promise<{ rateLimited?: boolean }> => {
     if (!image.preview && (image.type === 'Vector' || image.type === 'Video')) {
       const updatedImg = { 
         ...image, 
@@ -326,53 +418,77 @@ export default function App() {
         error: 'Reference image required (JPG/PNG with same filename)' 
       };
       setImages(prev => prev.map(img => img.id === image.id ? updatedImg : img));
-      return;
+      return {};
     }
 
     setImages(prev => prev.map(img => 
-      img.id === image.id ? { ...img, status: 'processing' } : img
+      img.id === image.id ? { ...img, status: 'processing', error: undefined } : img
     ));
 
     try {
-      const activeKey = settings.apiKeys.find(k => k.id === settings.activeKeyId) || null;
+      const currentSettings = settingsRef.current;
+      const activeKey = (currentSettings.apiKeys || []).find(k => k.id === currentSettings.activeKeyId) || null;
 
       let base64 = '';
       if (image.preview) {
-        // Since image.preview is a blob: URL or base64, compressing it is incredibly fast (sub-second) and light on memory
-        base64 = await compressToDataUrl(image.preview, 512, 512, 0.75);
-      } else if (image.file) {
-        // Compress the original File directly (no huge base64 strings loaded in JS memory!)
-        base64 = await compressToDataUrl(image.file, 512, 512, 0.75);
+        base64 = await compressToDataUrl(image.preview, 384, 384, 0.68);
+      }
+      if ((!base64 || !/^data:image\/(jpeg|png|webp);base64,/i.test(base64)) && image.file) {
+        base64 = await compressToDataUrl(image.file, 384, 384, 0.68);
       }
 
-      if (!base64) {
+      if (!base64 || !/^data:image\/(jpeg|png|webp);base64,/i.test(base64)) {
         throw new Error("Could not compress or prepare image data for analysis.");
       }
 
-      const data = await generateMetadataService(base64, settings, activeKey, image.type);
+      const fileExt = (image.fileName || image.file?.name || '').split('.').pop()?.toLowerCase() || '';
 
-      const completedImg = { 
-        ...image, 
+      let data;
+      try {
+        data = await generateMetadataService(base64, currentSettings, activeKey, image.type, fileExt);
+      } catch (err: any) {
+        const msg = String(err?.message || '').toLowerCase();
+        const isTransient =
+          msg.includes('429') ||
+          msg.includes('quota') ||
+          msg.includes('rate') ||
+          msg.includes('503') ||
+          msg.includes('high demand') ||
+          msg.includes('busy') ||
+          msg.includes('unavailable') ||
+          msg.includes('html') ||
+          msg.includes('non-json') ||
+          msg.includes('failed to fetch');
+        if (isTransient) {
+          await new Promise(r => setTimeout(r, 1000));
+          data = await generateMetadataService(base64, currentSettings, activeKey, image.type, fileExt);
+        } else {
+          throw err;
+        }
+      }
+
+      setImages(prev => prev.map(img => img.id === image.id ? {
+        ...img,
         ...data,
-        status: 'completed' as const 
-      };
-
-      setImages(prev => prev.map(img => img.id === image.id ? completedImg : img));
+        status: 'completed' as const
+      } : img));
+      return {};
     } catch (error) {
       console.error('Generation Error:', error);
       const errorMsg = error instanceof Error ? error.message : 'Generation failed';
-      const failedImg = { 
-        ...image, 
-        status: 'error' as const, 
-        error: errorMsg 
-      };
-      setImages(prev => prev.map(img => img.id === image.id ? failedImg : img));
+      const isRateLimited = /429|quota|rate|503|high demand|busy|unavailable/i.test(errorMsg);
+      setImages(prev => prev.map(img => img.id === image.id ? {
+        ...img,
+        status: 'error' as const,
+        error: errorMsg
+      } : img));
+      return { rateLimited: isRateLimited };
     }
   };
 
   const processBatch = async () => {
     setIsProcessingAll(true);
-    const pending = images.filter(img => {
+    const pending = imagesRef.current.filter(img => {
       const isIdleOrError = img.status === 'idle' || img.status === 'error';
       const needsPreview = (img.type === 'Vector' || img.type === 'Video');
       const hasPreview = !!img.preview;
@@ -384,10 +500,10 @@ export default function App() {
       return;
     }
     
-    // In safe mode (recommended for Free tier keys), use 2 concurrent workers with 1200ms delay to prevent 429 quota exhaustion.
-    const isSafe = settings.batchSpeed !== 'turbo';
-    const CONCURRENCY = isSafe ? 2 : 3;
-    const DELAY_MS = isSafe ? 1200 : 350;
+    // Safe Mode uses balanced concurrency to stay fast while avoiding 429 bursts on free-tier Gemini keys
+    const isSafe = settingsRef.current.batchSpeed !== 'turbo';
+    const CONCURRENCY = isSafe ? 3 : 6;
+    const DELAY_MS = isSafe ? 120 : 40;
     
     let completedCount = 0;
     setBatchProgress({
@@ -406,58 +522,49 @@ export default function App() {
         const assetName = img.fileName || img.file?.name || 'Asset';
         setBatchProgress(p => p ? { ...p, currentName: assetName } : null);
 
-        try {
-          await generateMetadata(img);
-        } catch (e: any) {
-          const msg = String(e?.message || '');
-          if (msg.includes('429') || msg.includes('quota') || msg.includes('rate limit')) {
-            setBatchProgress(p => p ? { ...p, isRateLimited: true } : null);
-            // Brief cooling pause on rate limit
-            await new Promise(r => setTimeout(r, 5000));
-            setBatchProgress(p => p ? { ...p, isRateLimited: false } : null);
-          }
+        const outcome = await generateMetadata(img);
+        if (outcome.rateLimited) {
+          setBatchProgress(p => p ? { ...p, isRateLimited: true } : null);
+          await new Promise(r => setTimeout(r, 1500));
+          setBatchProgress(p => p ? { ...p, isRateLimited: false } : null);
         }
 
         completedCount++;
         setBatchProgress(p => p ? { ...p, completed: Math.min(completedCount, pending.length) } : null);
 
-        // Controlled spacing between requests to stay below 15 RPM
-        if (queue.length > 0) {
+        if (queue.length > 0 && DELAY_MS > 0) {
           await new Promise(r => setTimeout(r, DELAY_MS));
         }
       }
     };
 
-    // Run up to CONCURRENCY workers concurrently
     const workers = Array.from({ length: Math.min(CONCURRENCY, queue.length) }, worker);
     await Promise.all(workers);
 
     setIsProcessingAll(false);
-    setTimeout(() => setBatchProgress(null), 3500);
+    setTimeout(() => setBatchProgress(null), 2500);
   };
 
-  const removeImage = async (id: string) => {
+  const removeImage = (id: string) => {
     setImages(prev => {
       const img = prev.find(i => i.id === id);
-      if (img?.preview && img.preview.startsWith('blob:')) URL.revokeObjectURL(img.preview);
+      if (img?.preview && img.preview.startsWith('blob:')) {
+        // Only revoke if no sibling asset shares the same blob URL
+        const isShared = prev.some(other => other.id !== id && other.preview === img.preview);
+        if (!isShared) URL.revokeObjectURL(img.preview);
+      }
       return prev.filter(i => i.id !== id);
     });
-    if (user) {
-      await deleteAssetFromDb(id).catch(e => console.error("Error deleting asset:", e));
-    }
   };
 
-  const clearAllImages = async () => {
-    images.forEach(img => {
+  const clearAllImages = () => {
+    imagesRef.current.forEach(img => {
       if (img.preview && img.preview.startsWith('blob:')) {
         URL.revokeObjectURL(img.preview);
       }
     });
     setImages([]);
     setShowClearConfirm(false);
-    if (user) {
-      await clearAllAssetsFromDb(user.uid).catch(e => console.error("Error clearing assets:", e));
-    }
   };
 
   const updateMetadata = (id: string, field: keyof ImageMetadata, value: any) => {
@@ -465,7 +572,7 @@ export default function App() {
   };
 
   const exportCSV = () => {
-    const data = images.map(img => ({
+    const data = imagesRef.current.map(img => ({
       Filename: img.fileName || img.file?.name || "unnamed_asset",
       Title: img.title,
       Description: img.description,
@@ -482,40 +589,55 @@ export default function App() {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
-  const setManualPreview = async (id: string, file: File) => {
-    const preview = URL.createObjectURL(file);
-    setImages(prev => prev.map(img => img.id === id ? { ...img, preview, status: img.status === 'error' ? 'idle' : img.status } : img));
+  const setManualPreview = (id: string, file: File) => {
+    const nextPreview = URL.createObjectURL(file);
+    setImages(prev => prev.map(img => {
+      if (img.id !== id) return img;
+      if (img.preview && img.preview.startsWith('blob:')) {
+        const isShared = prev.some(other => other.id !== id && other.preview === img.preview);
+        if (!isShared) URL.revokeObjectURL(img.preview);
+      }
+      return { ...img, preview: nextPreview, status: img.status === 'error' ? 'idle' : img.status };
+    }));
   };
 
   const copyKeywords = (keywords: string[]) => {
-    navigator.clipboard.writeText(keywords.join(', '));
+    navigator.clipboard?.writeText(keywords.join(', ')).catch(() => {});
   };
 
-  // Keyboard Shortcuts
-  React.useEffect(() => {
+  const processBatchRef = useRef(processBatch);
+  processBatchRef.current = processBatch;
+  const exportCsvRef = useRef(exportCSV);
+  exportCsvRef.current = exportCSV;
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
+  const isAdminRef = useRef(userProfile?.role === 'admin');
+  isAdminRef.current = userProfile?.role === 'admin';
+
+  // Keyboard Shortcuts (stable mount listener using refs)
+  useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Export: Ctrl + S
       if ((e.ctrlKey || e.metaKey) && e.key === 's') {
         e.preventDefault();
-        if (images.length > 0) exportCSV();
+        if (imagesRef.current.length > 0) exportCsvRef.current();
       }
-      // Generate: Ctrl + Enter
       if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
         e.preventDefault();
-        if (activeTab === 'metadata') processBatch();
+        if (activeTabRef.current === 'metadata') processBatchRef.current();
       }
-      // Switch Tabs: Ctrl + 1, 2, 3, 4
       if ((e.ctrlKey || e.metaKey) && e.key === '1') setActiveTab('metadata');
       if ((e.ctrlKey || e.metaKey) && e.key === '2') setActiveTab('studio');
-      if ((e.ctrlKey || e.metaKey) && e.key === '3') setActiveTab('settings');
-      if ((e.ctrlKey || e.metaKey) && e.key === '4' && userProfile?.role === 'admin') setActiveTab('admin');
+      if ((e.ctrlKey || e.metaKey) && e.key === '3') setActiveTab('techbg');
+      if ((e.ctrlKey || e.metaKey) && e.key === '4') setActiveTab('settings');
+      if ((e.ctrlKey || e.metaKey) && e.key === '5' && isAdminRef.current) setActiveTab('admin');
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [images, activeTab]);
+  }, []);
 
   if (loadingAuth) {
     return (
@@ -648,10 +770,17 @@ export default function App() {
                 onClick={() => setActiveTab('studio')} 
               />
               <SidebarItem 
+                active={activeTab === 'techbg'} 
+                icon={<Cpu className="w-4 h-4 text-indigo-600" />} 
+                label="BG Studio" 
+                shortcut="^3"
+                onClick={() => setActiveTab('techbg')} 
+              />
+              <SidebarItem 
                 active={activeTab === 'settings'} 
                 icon={<Settings className="w-4 h-4" />} 
                 label="AI Configuration" 
-                shortcut="^3"
+                shortcut="^4"
                 onClick={() => setActiveTab('settings')} 
               />
               {userProfile?.role === 'admin' && (
@@ -659,7 +788,7 @@ export default function App() {
                   active={activeTab === 'admin'} 
                   icon={<Shield className="w-4 h-4 text-indigo-600" />} 
                   label="Admin Dashboard" 
-                  shortcut="^4"
+                  shortcut="^5"
                   onClick={() => setActiveTab('admin')} 
                 />
               )}
@@ -737,6 +866,24 @@ export default function App() {
                     className="w-full bg-slate-50 border border-slate-200 rounded-xl px-2.5 py-1.5 text-xs text-slate-800 placeholder:text-slate-400 focus:outline-none focus:border-indigo-500 shadow-xs"
                   />
                 </div>
+
+                {/* Transparent Background Toggle */}
+                <label className="flex items-start gap-2.5 p-2.5 rounded-xl bg-slate-50 border border-slate-200 hover:border-indigo-300 transition-colors cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(settings.transparentBackground)}
+                    onChange={(e) => setSettings(s => ({ ...s, transparentBackground: e.target.checked }))}
+                    className="mt-0.5 w-3.5 h-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer accent-indigo-600 shrink-0"
+                  />
+                  <div className="min-w-0">
+                    <span className="text-[11px] font-bold text-slate-800 block leading-tight">
+                      Transparent Background
+                    </span>
+                    <span className="text-[9px] text-slate-500 block mt-0.5 leading-snug">
+                      Adds &ldquo;transparent&rdquo; to title, removes &ldquo;white background&rdquo; &amp; adds PNG/transparent keywords
+                    </span>
+                  </div>
+                </label>
               </div>
             )}
 
@@ -809,19 +956,19 @@ export default function App() {
                 transition={{ duration: 0.2 }}
                 className="space-y-6"
               >
-                {!settings.activeKeyId && (
+                {!settings.apiKeys.some(k => Boolean(k.key?.trim())) && (
                   <div className="bg-amber-50 border border-amber-200 p-4 rounded-2xl flex items-center gap-3.5 shadow-xs">
                     <div className="p-2 bg-amber-100 rounded-xl text-amber-700 shrink-0">
                       <Key className="w-5 h-5" />
                     </div>
                     <div className="flex-1">
-                      <h4 className="text-xs font-bold text-amber-900 uppercase tracking-tight">API Key Required</h4>
+                      <h4 className="text-xs font-bold text-amber-900 uppercase tracking-tight">User API Key Required</h4>
                       <p className="text-xs text-amber-700 mt-0.5">
-                        LensLogic requires a Gemini API Key to analyze your assets. Go to{' '}
-                        <button onClick={() => setActiveTab('settings')} className="underline font-bold hover:text-amber-900">
+                        Add your own Gemini or Groq API key in{' '}
+                        <button onClick={() => setActiveTab('settings')} className="underline font-bold hover:text-amber-900 cursor-pointer">
                           AI Configuration
                         </button>{' '}
-                        to add your free key.
+                        to analyze uploaded files and generate metadata.
                       </p>
                     </div>
                   </div>
@@ -834,9 +981,13 @@ export default function App() {
                       <div className="flex items-center gap-2">
                         <RefreshCw className="w-4 h-4 animate-spin text-indigo-600" />
                         <span className="font-bold text-indigo-950">
-                          Analyzing {batchProgress.completed} of {batchProgress.total}:
+                          {batchProgress.isRateLimited
+                            ? 'Cooling down briefly (rate limit)...'
+                            : `Analyzing ${batchProgress.completed} of ${batchProgress.total}:`}
                         </span>
-                        <span className="text-indigo-700 font-medium truncate max-w-xs">{batchProgress.currentName}</span>
+                        {!batchProgress.isRateLimited && (
+                          <span className="text-indigo-700 font-medium truncate max-w-xs">{batchProgress.currentName}</span>
+                        )}
                       </div>
                       <span className="font-mono text-indigo-700 font-bold text-xs">
                         {Math.round((batchProgress.completed / Math.max(1, batchProgress.total)) * 100)}%
@@ -917,25 +1068,35 @@ export default function App() {
                         </div>
 
                         {/* Batch Action Buttons */}
-                        {images.filter(i => i.status === 'idle').length > 0 && (
-                          <button 
-                            onClick={processBatch}
-                            disabled={isProcessingAll}
-                            className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition-all shadow-sm hover:shadow flex items-center gap-2 cursor-pointer"
-                          >
-                            {isProcessingAll ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
-                            Generate All ({images.filter(i => i.status === 'idle').length})
-                          </button>
-                        )}
+                        {(() => {
+                          const pendingCount = images.filter(
+                            i => (i.status === 'idle' || i.status === 'error') && (Boolean(i.preview) || (i.type !== 'Vector' && i.type !== 'Video'))
+                          ).length;
+                          if (pendingCount === 0) return null;
+                          const idleCount = images.filter(i => i.status === 'idle').length;
+                          return (
+                            <button 
+                              type="button"
+                              onClick={processBatch}
+                              disabled={isProcessingAll}
+                              className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition-all shadow-sm hover:shadow flex items-center gap-2 cursor-pointer"
+                            >
+                              {isProcessingAll ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                              {idleCount > 0 ? `Generate All (${pendingCount})` : `Retry Failed (${pendingCount})`}
+                            </button>
+                          );
+                        })()}
 
-                        <button 
+                        <div 
                           {...getRootProps()}
+                          role="button"
+                          tabIndex={0}
                           className="px-3.5 py-2 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 rounded-xl text-xs font-semibold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer"
                         >
                           <input {...getInputProps()} />
                           <Plus className="w-3.5 h-3.5" />
                           Add More Files
-                        </button>
+                        </div>
 
                         <button 
                           onClick={exportCSV}
@@ -996,6 +1157,7 @@ export default function App() {
                             onUpdate={(field: keyof ImageMetadata, val: any) => updateMetadata(image.id, field, val)}
                             onSetPreview={(file: File) => setManualPreview(image.id, file)}
                             onCopyKeywords={() => copyKeywords(image.keywords)}
+                            onOpenSettings={() => setActiveTab('settings')}
                           />
                         ))}
                       </div>
@@ -1014,6 +1176,24 @@ export default function App() {
                 transition={{ duration: 0.2 }}
               >
                 <FreepikConverter />
+              </motion.div>
+            )}
+
+            {activeTab === 'techbg' && (
+              <motion.div
+                key="techbg"
+                initial={{ opacity: 0, y: 16 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -16 }}
+                transition={{ duration: 0.2 }}
+              >
+                <BgStudio
+                  geminiApiKey={
+                    settings.apiKeys?.find((k) => k.id === settings.activeKeyId && k.provider === 'Gemini')?.key ||
+                    settings.apiKeys?.find((k) => k.provider === 'Gemini' && k.key)?.key ||
+                    undefined
+                  }
+                />
               </motion.div>
             )}
 
@@ -1045,7 +1225,7 @@ export default function App() {
                           setSettings(s => ({ 
                             ...s, 
                             apiKeys: [...s.apiKeys, { id, label: 'Gemini Key', key: '', provider: 'Gemini' }],
-                            activeKeyId: s.activeKeyId || id
+                            activeKeyId: id
                           }));
                         }}
                         className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-semibold transition-all cursor-pointer shadow-xs flex items-center gap-1.5"
@@ -1057,19 +1237,36 @@ export default function App() {
 
                     <div className="space-y-3">
                       {settings.apiKeys.length === 0 && (
-                        <div className="p-4 border border-emerald-200 rounded-2xl bg-emerald-50/50 flex items-center justify-between">
+                        <div className="p-4 border border-indigo-200 rounded-2xl bg-indigo-50/40 space-y-3">
                           <div className="flex items-center gap-3">
-                            <div className="w-8 h-8 rounded-xl bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0">
-                              <Sparkles className="w-4 h-4" />
+                            <div className="w-8 h-8 rounded-xl bg-indigo-100 text-indigo-700 flex items-center justify-center shrink-0">
+                              <Key className="w-4 h-4" />
                             </div>
                             <div>
-                              <p className="text-xs font-bold text-slate-800">Server-Side Gemini Engine Active</p>
-                              <p className="text-[11px] text-slate-500">Ready to generate metadata automatically for everyone. You can optionally add custom keys above.</p>
+                              <p className="text-xs font-bold text-slate-900">Quick Setup: Paste Your API Key</p>
+                              <p className="text-[11px] text-slate-600">Enter your Gemini or Groq API key below to start generating metadata immediately.</p>
                             </div>
                           </div>
-                          <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-200">
-                            Active
-                          </span>
+                          <input
+                            type="password"
+                            placeholder="Paste Gemini (AIzaSy...) or Groq (gsk_...) API key here"
+                            value=""
+                            onChange={(e) => {
+                              const cleaned = e.target.value.trim();
+                              if (!cleaned) return;
+                              const detectedProvider = cleaned.startsWith('gsk_') ? 'Groq' : 'Gemini';
+                              const id = Math.random().toString(36).substring(7);
+                              setSettings(s => ({
+                                ...s,
+                                apiKeys: [
+                                  ...s.apiKeys,
+                                  { id, label: detectedProvider === 'Groq' ? 'Groq Key' : 'Gemini Key', key: cleaned, provider: detectedProvider }
+                                ],
+                                activeKeyId: id
+                              }));
+                            }}
+                            className="w-full bg-white border border-indigo-200 rounded-xl px-3.5 py-2 text-xs text-slate-800 placeholder:text-slate-400 focus:outline-none focus:border-indigo-600 font-mono shadow-xs"
+                          />
                         </div>
                       )}
                       
@@ -1097,6 +1294,11 @@ export default function App() {
                                 }}
                                 className="bg-transparent text-xs font-bold text-slate-800 focus:outline-none border-b border-transparent focus:border-slate-400 w-36"
                               />
+                              {settings.activeKeyId === entry.id && (
+                                <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700 border border-indigo-200">
+                                  Active
+                                </span>
+                              )}
                             </div>
                             <button 
                               onClick={() => {
@@ -1126,16 +1328,32 @@ export default function App() {
                               <option value="Gemini">Gemini</option>
                               <option value="Groq">Groq</option>
                             </select>
-                            <input 
-                              type="password"
-                              placeholder="AIzaSy..."
-                              value={entry.key}
-                              onChange={(e) => {
-                                const newKeys = settings.apiKeys.map(k => k.id === entry.id ? { ...k, key: e.target.value } : k);
-                                setSettings(s => ({ ...s, apiKeys: newKeys }));
-                              }}
-                              className="flex-1 bg-white border border-slate-200 rounded-lg px-3 py-1.5 text-xs text-slate-800 focus:outline-none focus:border-indigo-500 font-mono shadow-xs"
-                            />
+                            <div className="flex-1 relative">
+                              <input 
+                                type={visibleKeyIds[entry.id] ? "text" : "password"}
+                                placeholder={entry.provider === 'Groq' ? "gsk_..." : "AIzaSy..."}
+                                value={entry.key}
+                                onChange={(e) => {
+                                  const cleaned = e.target.value.trim();
+                                  const autoProvider = cleaned.startsWith('gsk_')
+                                    ? 'Groq'
+                                    : cleaned.startsWith('AIza')
+                                      ? 'Gemini'
+                                      : entry.provider;
+                                  const newKeys = settings.apiKeys.map(k => k.id === entry.id ? { ...k, key: cleaned, provider: autoProvider } : k);
+                                  setSettings(s => ({ ...s, apiKeys: newKeys, activeKeyId: s.activeKeyId || entry.id }));
+                                }}
+                                className="w-full bg-white border border-slate-200 rounded-lg pl-3 pr-9 py-1.5 text-xs text-slate-800 focus:outline-none focus:border-indigo-500 font-mono shadow-xs"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => setVisibleKeyIds(prev => ({ ...prev, [entry.id]: !prev[entry.id] }))}
+                                className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 cursor-pointer"
+                                title={visibleKeyIds[entry.id] ? "Hide API Key" : "Show API Key"}
+                              >
+                                {visibleKeyIds[entry.id] ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                              </button>
+                            </div>
                           </div>
                         </div>
                       ))}
@@ -1188,57 +1406,7 @@ export default function App() {
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-5 pt-4 border-t border-slate-100">
-                    <div className="space-y-1.5">
-                      <label className="text-[11px] font-bold text-slate-400 uppercase tracking-widest">Title Constraints</label>
-                      <select 
-                        value={settings.titleLength}
-                        onChange={(e) => setSettings(s => ({ ...s, titleLength: e.target.value }))}
-                        className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs font-medium text-slate-800 focus:outline-none focus:border-indigo-500 cursor-pointer shadow-xs"
-                      >
-                        <option value="20-50">Short (20-50 chars)</option>
-                        <option value="20-100">Medium (20-100 chars)</option>
-                        <option value="20-200">Long (20-200 chars)</option>
-                      </select>
-                    </div>
-
-                    <div className="space-y-1.5">
-                      <label className="text-[11px] font-bold text-slate-400 uppercase tracking-widest">Keyword Count</label>
-                      <input 
-                        type="number" 
-                        min="10" 
-                        max="50"
-                        value={settings.keywordCount}
-                        onChange={(e) => setSettings(s => ({ ...s, keywordCount: parseInt(e.target.value) }))}
-                        className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs font-medium text-slate-800 focus:outline-none focus:border-indigo-500 shadow-xs"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-                    <div className="space-y-1.5">
-                      <label className="text-[11px] font-bold text-slate-400 uppercase tracking-widest">Title Prefix</label>
-                      <input 
-                        type="text" 
-                        placeholder="e.g. Premium"
-                        value={settings.prefix}
-                        onChange={(e) => setSettings(s => ({ ...s, prefix: e.target.value }))}
-                        className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs text-slate-800 placeholder:text-slate-400 focus:outline-none focus:border-indigo-500 shadow-xs"
-                      />
-                    </div>
-                    <div className="space-y-1.5">
-                      <label className="text-[11px] font-bold text-slate-400 uppercase tracking-widest">Title Suffix</label>
-                      <input 
-                        type="text" 
-                        placeholder="e.g. 2025"
-                        value={settings.suffix}
-                        onChange={(e) => setSettings(s => ({ ...s, suffix: e.target.value }))}
-                        className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs text-slate-800 placeholder:text-slate-400 focus:outline-none focus:border-indigo-500 shadow-xs"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="space-y-1.5">
+                  <div className="space-y-1.5 pt-4 border-t border-slate-100">
                     <label className="text-[11px] font-bold text-slate-400 uppercase tracking-widest">Negative Keywords</label>
                     <textarea 
                       placeholder="Exclude terms like: blur, noisy, low-quality"
@@ -1310,7 +1478,8 @@ const MetadataRow = React.memo(function MetadataRow({
   onRemove, 
   onUpdate,
   onSetPreview,
-  onCopyKeywords
+  onCopyKeywords,
+  onOpenSettings
 }: any) {
   const [copied, setCopied] = useState(false);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
@@ -1370,8 +1539,15 @@ const MetadataRow = React.memo(function MetadataRow({
           />
           
           {image.preview ? (
-            <div className="relative w-full h-full bg-slate-100">
-              <img src={image.preview} alt="preview" className="w-full h-full object-cover" />
+            <div className={cn("relative w-full h-full", image.type === 'Vector' ? "bg-white" : "bg-slate-100")}>
+              <img
+                src={image.preview}
+                alt="preview"
+                className={cn(
+                  "w-full h-full",
+                  image.type === 'Vector' ? "object-contain p-1.5" : "object-cover"
+                )}
+              />
               {(image.type === 'Vector' || image.type === 'Video') && (
                 <button 
                   onClick={() => fileInputRef.current?.click()}
@@ -1402,8 +1578,8 @@ const MetadataRow = React.memo(function MetadataRow({
           )}
           
           {image.preview && (image.type === 'Video' || (image.type === 'Vector' && !(image.fileName || image.file?.name || '').toLowerCase().endsWith('.svg'))) && (
-            <div className="absolute top-2 right-2 px-2 py-0.5 bg-emerald-600/90 backdrop-blur-sm rounded text-[8px] font-bold text-white flex items-center gap-1 shadow-xs">
-              <Check className="w-2.5 h-2.5" /> REF MATCHED
+            <div className="absolute bottom-2 left-2 px-2 py-0.5 bg-emerald-600/90 backdrop-blur-sm rounded text-[8px] font-bold text-white flex items-center gap-1 shadow-xs">
+              <Check className="w-2.5 h-2.5" /> PREVIEW READY
             </div>
           )}
 
@@ -1445,9 +1621,20 @@ const MetadataRow = React.memo(function MetadataRow({
                       <AlertCircle className="w-3 h-3" /> Preview Image Required for AI
                     </p>
                   ) : image.status === 'error' ? (
-                    <p className="text-[10px] text-rose-600 font-semibold tracking-wide flex items-center gap-1 mt-0.5">
-                      <AlertCircle className="w-3 h-3" /> {image.error || 'Generation Error'}
-                    </p>
+                    <div className="flex flex-wrap items-center gap-2 mt-0.5">
+                      <p className="text-[10px] text-rose-600 font-semibold tracking-wide flex items-center gap-1">
+                        <AlertCircle className="w-3 h-3 shrink-0" /> {image.error || 'Generation Error'}
+                      </p>
+                      {/api key/i.test(image.error || '') && onOpenSettings && (
+                        <button
+                          type="button"
+                          onClick={onOpenSettings}
+                          className="text-[10px] font-bold text-indigo-600 hover:text-indigo-800 underline cursor-pointer"
+                        >
+                          Open AI Configuration
+                        </button>
+                      )}
+                    </div>
                   ) : (
                     <p className="text-[10px] text-slate-500 font-medium tracking-wide mt-0.5">Ready for metadata generation</p>
                   )}

@@ -6,22 +6,24 @@ import {
   Image as ImageIcon, 
   UserPlus, 
   LogIn, 
-  AlertCircle 
+  AlertCircle,
+  ArrowLeft
 } from 'lucide-react';
-import { getApiUrl } from '../services/dbService';
+import { ensureGuestSession, getApiUrl, setAuthToken } from '../services/dbService';
 
 interface AuthScreenProps {
   onAuthSuccess: (user: any) => void;
+  onCancel?: () => void;
 }
 
-export default function AuthScreen({ onAuthSuccess }: AuthScreenProps) {
+export default function AuthScreen({ onAuthSuccess, onCancel }: AuthScreenProps) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [isSignUp, setIsSignUp] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [apiUrlInput, setApiUrlInput] = useState(() => {
-    return localStorage.getItem("LENS_LOGIC_API_URL") || (typeof process !== "undefined" && process.env?.APP_URL) || "";
+    return localStorage.getItem("LENS_LOGIC_API_URL") || "";
   });
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -55,7 +57,10 @@ export default function AuthScreen({ onAuthSuccess }: AuthScreenProps) {
       }
 
       const authenticatedUser = data.user;
-      
+      if (data.token) {
+        setAuthToken(data.token);
+      }
+
       // Store in localStorage for persistence
       localStorage.setItem('lenslogic_user', JSON.stringify(authenticatedUser));
       
@@ -68,19 +73,11 @@ export default function AuthScreen({ onAuthSuccess }: AuthScreenProps) {
     }
   };
 
-  const handleGuestMode = () => {
+  const handleGuestMode = async () => {
     setLoading(true);
     setError('');
     try {
-      const guestUser = {
-        uid: 'guest_' + Math.random().toString(36).substring(2, 11),
-        email: 'guest@lenslogic.ai',
-        role: 'user',
-        savedSettings: null,
-        createdAt: new Date().toISOString()
-      };
-      
-      localStorage.setItem('lenslogic_user', JSON.stringify(guestUser));
+      const guestUser = await ensureGuestSession();
       onAuthSuccess(guestUser);
     } catch (err: any) {
       setError('Failed to log in as guest. ' + err.message);
@@ -188,21 +185,25 @@ export default function AuthScreen({ onAuthSuccess }: AuthScreenProps) {
             Explore as Guest
           </button>
 
-          <div className="mt-5 text-center">
+          <div className="mt-5 flex items-center justify-center gap-4">
             <button
+              type="button"
               onClick={() => setIsSignUp(!isSignUp)}
               className="text-xs text-indigo-600 hover:text-indigo-700 font-medium cursor-pointer"
             >
               {isSignUp ? "Already have an account? Sign In" : "Don't have an account? Create one"}
             </button>
+            {onCancel && (
+              <button
+                type="button"
+                onClick={onCancel}
+                className="text-xs text-slate-500 hover:text-slate-800 font-medium inline-flex items-center gap-1 cursor-pointer"
+              >
+                <ArrowLeft className="w-3.5 h-3.5" />
+                Back to Studio
+              </button>
+            )}
           </div>
-        </div>
-
-        {/* Demo Admin Account Tip */}
-        <div className="mt-4 p-3.5 rounded-2xl bg-indigo-50/70 border border-indigo-100 text-center">
-          <p className="text-xs text-slate-600">
-            💡 <strong className="text-indigo-900">Admin Account:</strong> Access using <span className="font-mono text-indigo-700 font-medium">msany6117@gmail.com</span> / <span className="font-mono text-indigo-700 font-medium">Admin@124390</span>
-          </p>
         </div>
 
         {/* Backend Connection Settings */}

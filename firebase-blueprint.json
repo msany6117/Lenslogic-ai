@@ -59,7 +59,7 @@
         },
         "type": {
           "type": "string",
-          "enum": ["Photo", "Video", "Vector"]
+          "enum": ["Photo", "Video", "Vector", "Illustration"]
         },
         "preview": {
           "type": "string",
@@ -67,7 +67,7 @@
         },
         "status": {
           "type": "string",
-          "enum": ["idle", "generating", "completed", "error"]
+          "enum": ["idle", "processing", "completed", "error"]
         },
         "errorMsg": {
           "type": "string"

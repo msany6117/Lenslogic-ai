@@ -78,6 +78,7 @@ export interface VectorPreviewInfo {
   height: number;
   isTransparent: boolean;
   sourceType: string;
+  isPlaceholder?: boolean;
 }
 
 const MIN_EPS_SIZE = 1 * 1024 * 1024; // 1MB strictly required by Freepik
@@ -103,6 +104,13 @@ export function findPdfBuffer(buffer: ArrayBuffer): ArrayBuffer | null {
   return null;
 }
 
+function cleanXmpBase64(raw: string): string {
+  // Illustrator XMP encodes linebreaks as &#xA; / &#xD; / &#10; / &#13;
+  return raw
+    .replace(/&#x?[0-9a-f]+;/gi, '')
+    .replace(/[\r\n\s]/g, '');
+}
+
 /**
  * Extracts base64 XMP embedded thumbnail from Adobe Illustrator (.ai) or EPS files
  */
@@ -111,7 +119,7 @@ export function extractXmpThumbnail(buffer: ArrayBuffer): string | null {
     const bytes = new Uint8Array(buffer);
     const decoder = new TextDecoder('latin1');
     const headChunk = bytes.subarray(0, Math.min(bytes.length, 4194304));
-    let text = decoder.decode(headChunk);
+    const text = decoder.decode(headChunk);
 
     let match = text.match(/<(?:xmpGImg|xapGImg):image[^>]*>([\s\S]*?)<\/(?:xmpGImg|xapGImg):image>/i);
     if (!match && bytes.length > 4194304) {
@@ -121,9 +129,10 @@ export function extractXmpThumbnail(buffer: ArrayBuffer): string | null {
     }
 
     if (match && match[1]) {
-      const cleanBase64 = match[1].replace(/[\r\n\s]/g, '');
+      const cleanBase64 = cleanXmpBase64(match[1]);
       if (cleanBase64.length > 50) {
-        return `data:image/jpeg;base64,${cleanBase64}`;
+        const mime = cleanBase64.startsWith('iVBOR') ? 'image/png' : 'image/jpeg';
+        return `data:${mime};base64,${cleanBase64}`;
       }
     }
   } catch (e) {
@@ -149,11 +158,12 @@ export function extractBinaryJpegThumbnail(buffer: ArrayBuffer): string | null {
             if (slice[j] === 0xff && slice[j + 1] === 0xd9) {
               const jpegSlice = slice.subarray(i, j + 2);
               if (jpegSlice.length >= 600) {
-                let binary = '';
-                for (let k = 0; k < jpegSlice.length; k++) {
-                  binary += String.fromCharCode(jpegSlice[k]);
+                const CHUNK = 8192;
+                const parts: string[] = [];
+                for (let k = 0; k < jpegSlice.length; k += CHUNK) {
+                  parts.push(String.fromCharCode(...jpegSlice.subarray(k, Math.min(k + CHUNK, jpegSlice.length))));
                 }
-                return 'data:image/jpeg;base64,' + btoa(binary);
+                return 'data:image/jpeg;base64,' + btoa(parts.join(''));
               }
             }
           }
@@ -179,15 +189,267 @@ export function extractBinaryJpegThumbnail(buffer: ArrayBuffer): string | null {
 }
 
 /**
+ * Decodes EPSI ASCII hex preview (`%%BeginPreview: width height depth lines`) to a canvas
+ */
+export function extractEpsiPreviewCanvas(buffer: ArrayBuffer): HTMLCanvasElement | null {
+  try {
+    const bytes = new Uint8Array(buffer);
+    const decoder = new TextDecoder('latin1');
+    const text = decoder.decode(bytes.subarray(0, Math.min(bytes.length, 4194304)));
+    const match = text.match(/%%BeginPreview:\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)([\s\S]*?)%%EndPreview/i);
+    if (!match) return null;
+
+    const width = parseInt(match[1], 10);
+    const height = parseInt(match[2], 10);
+    const depth = parseInt(match[3], 10);
+    if (!width || !height || width > 4096 || height > 4096) return null;
+
+    const hexData = match[5].replace(/[^0-9a-fA-F]/g, '');
+    if (hexData.length < 16) return null;
+
+    const rawBytes = new Uint8Array(Math.floor(hexData.length / 2));
+    for (let i = 0; i < rawBytes.length; i++) {
+      rawBytes[i] = parseInt(hexData.slice(i * 2, i * 2 + 2), 16);
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+    const imgData = ctx.createImageData(width, height);
+    const out = imgData.data;
+
+    if (depth === 1) {
+      const rowBytes = Math.ceil(width / 8);
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const byteIdx = y * rowBytes + (x >> 3);
+          const bit = (rawBytes[byteIdx] >> (7 - (x & 7))) & 1;
+          const v = bit ? 0 : 255;
+          const idx = (y * width + x) * 4;
+          out[idx] = v;
+          out[idx + 1] = v;
+          out[idx + 2] = v;
+          out[idx + 3] = 255;
+        }
+      }
+    } else if (depth === 8) {
+      for (let i = 0; i < width * height && i < rawBytes.length; i++) {
+        const v = rawBytes[i];
+        const idx = i * 4;
+        out[idx] = v;
+        out[idx + 1] = v;
+        out[idx + 2] = v;
+        out[idx + 3] = 255;
+      }
+    } else if (depth === 24) {
+      for (let i = 0; i < width * height && i * 3 + 2 < rawBytes.length; i++) {
+        const idx = i * 4;
+        out[idx] = rawBytes[i * 3];
+        out[idx + 1] = rawBytes[i * 3 + 1];
+        out[idx + 2] = rawBytes[i * 3 + 2];
+        out[idx + 3] = 255;
+      }
+    } else {
+      return null;
+    }
+
+    ctx.putImageData(imgData, 0, 0);
+    return canvas;
+  } catch (e) {
+    console.warn('EPSI preview extraction notice:', e);
+    return null;
+  }
+}
+
+/**
+ * Decodes DOS EPS binary header (`C5 D0 D3 C6`) embedded TIFF preview onto a canvas
+ */
+export function extractDosEpsTiffPreviewCanvas(buffer: ArrayBuffer): HTMLCanvasElement | null {
+  try {
+    if (buffer.byteLength < 64) return null;
+    const view = new DataView(buffer);
+    // DOS EPS magic: C5 D0 D3 C6
+    if (view.getUint32(0, false) !== 0xc5d0d3c6) return null;
+
+    const tiffOffset = view.getUint32(20, true);
+    const tiffLength = view.getUint32(24, true);
+    if (!tiffOffset || tiffLength < 16 || tiffOffset + tiffLength > buffer.byteLength) return null;
+
+    const tiff = new DataView(buffer, tiffOffset, tiffLength);
+    const byteOrder = tiff.getUint16(0, false);
+    const le = byteOrder === 0x4949; // 'II'
+    if (!le && byteOrder !== 0x4d4d) return null; // 'MM'
+    if (tiff.getUint16(2, le) !== 42) return null;
+
+    const ifdOffset = tiff.getUint32(4, le);
+    const numEntries = tiff.getUint16(ifdOffset, le);
+
+    let width = 0;
+    let height = 0;
+    let bitsPerSample: number[] = [8];
+    let compression = 1;
+    let photometric = 2;
+    let stripOffsets: number[] = [];
+    let stripByteCounts: number[] = [];
+    let samplesPerPixel = 1;
+    let colorMap: number[] = [];
+
+    const readValues = (type: number, count: number, valOffsetField: number): number[] => {
+      const sizes: Record<number, number> = { 1: 1, 2: 1, 3: 2, 4: 4, 5: 8 };
+      const elemSize = sizes[type] || 1;
+      const totalBytes = count * elemSize;
+      const dataStart = totalBytes <= 4 ? valOffsetField : tiff.getUint32(valOffsetField, le);
+      const res: number[] = [];
+      for (let k = 0; k < count; k++) {
+        const pos = dataStart + k * elemSize;
+        if (pos + elemSize > tiffLength) break;
+        if (type === 3) res.push(tiff.getUint16(pos, le));
+        else if (type === 4) res.push(tiff.getUint32(pos, le));
+        else res.push(tiff.getUint8(pos));
+      }
+      return res;
+    };
+
+    for (let i = 0; i < numEntries; i++) {
+      const entryOffset = ifdOffset + 2 + i * 12;
+      if (entryOffset + 12 > tiffLength) break;
+      const tag = tiff.getUint16(entryOffset, le);
+      const type = tiff.getUint16(entryOffset + 2, le);
+      const count = tiff.getUint32(entryOffset + 4, le);
+      const valField = entryOffset + 8;
+      const vals = readValues(type, count, valField);
+
+      if (tag === 256) width = vals[0] || 0;
+      else if (tag === 257) height = vals[0] || 0;
+      else if (tag === 258) bitsPerSample = vals;
+      else if (tag === 259) compression = vals[0] || 1;
+      else if (tag === 262) photometric = vals[0] ?? 2;
+      else if (tag === 273) stripOffsets = vals;
+      else if (tag === 277) samplesPerPixel = vals[0] || 1;
+      else if (tag === 279) stripByteCounts = vals;
+      else if (tag === 320) colorMap = vals;
+    }
+
+    if (!width || !height || width > 4096 || height > 4096 || stripOffsets.length === 0) return null;
+    if (compression !== 1 && compression !== 32773) return null; // Uncompressed or PackBits
+
+    // Assemble raw image bytes from strips
+    const chunks: Uint8Array[] = [];
+    let totalRaw = 0;
+    for (let s = 0; s < stripOffsets.length; s++) {
+      const off = stripOffsets[s];
+      const len = stripByteCounts[s] || (tiffLength - off);
+      if (off >= tiffLength) continue;
+      const slice = new Uint8Array(buffer, tiffOffset + off, Math.min(len, tiffLength - off));
+      if (compression === 1) {
+        chunks.push(slice);
+        totalRaw += slice.length;
+      } else {
+        // PackBits decode
+        const decoded: number[] = [];
+        let p = 0;
+        while (p < slice.length) {
+          const n = (slice[p] << 24) >> 24; // signed int8
+          p++;
+          if (n >= 0) {
+            const cnt = n + 1;
+            for (let k = 0; k < cnt && p < slice.length; k++) decoded.push(slice[p++]);
+          } else if (n >= -127) {
+            const cnt = 1 - n;
+            const b = slice[p++];
+            for (let k = 0; k < cnt; k++) decoded.push(b);
+          }
+        }
+        const arr = new Uint8Array(decoded);
+        chunks.push(arr);
+        totalRaw += arr.length;
+      }
+    }
+
+    const raw = new Uint8Array(totalRaw);
+    let offsetAcc = 0;
+    for (const c of chunks) {
+      raw.set(c, offsetAcc);
+      offsetAcc += c.length;
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+    const imgData = ctx.createImageData(width, height);
+    const out = imgData.data;
+
+    const bps = bitsPerSample[0] || 8;
+    if (photometric === 3 && colorMap.length >= 256 * 3 && bps === 8) {
+      // Palette color
+      const mapLen = colorMap.length / 3;
+      for (let i = 0; i < width * height && i < raw.length; i++) {
+        const idxVal = raw[i];
+        const outIdx = i * 4;
+        out[outIdx] = (colorMap[idxVal] >> 8) & 0xff;
+        out[outIdx + 1] = (colorMap[idxVal + mapLen] >> 8) & 0xff;
+        out[outIdx + 2] = (colorMap[idxVal + mapLen * 2] >> 8) & 0xff;
+        out[outIdx + 3] = 255;
+      }
+    } else if (samplesPerPixel >= 3 && bps === 8) {
+      for (let i = 0; i < width * height && i * samplesPerPixel + 2 < raw.length; i++) {
+        const pIdx = i * samplesPerPixel;
+        const outIdx = i * 4;
+        out[outIdx] = raw[pIdx];
+        out[outIdx + 1] = raw[pIdx + 1];
+        out[outIdx + 2] = raw[pIdx + 2];
+        out[outIdx + 3] = samplesPerPixel >= 4 ? raw[pIdx + 3] : 255;
+      }
+    } else if (samplesPerPixel === 1 && bps === 8) {
+      for (let i = 0; i < width * height && i < raw.length; i++) {
+        const v = photometric === 0 ? 255 - raw[i] : raw[i];
+        const outIdx = i * 4;
+        out[outIdx] = v;
+        out[outIdx + 1] = v;
+        out[outIdx + 2] = v;
+        out[outIdx + 3] = 255;
+      }
+    } else if (samplesPerPixel === 1 && bps === 1) {
+      const rowBytes = Math.ceil(width / 8);
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const byteIdx = y * rowBytes + (x >> 3);
+          const bit = (raw[byteIdx] >> (7 - (x & 7))) & 1;
+          const v = photometric === 0 ? (bit ? 0 : 255) : (bit ? 255 : 0);
+          const outIdx = (y * width + x) * 4;
+          out[outIdx] = v;
+          out[outIdx + 1] = v;
+          out[outIdx + 2] = v;
+          out[outIdx + 3] = 255;
+        }
+      }
+    } else {
+      return null;
+    }
+
+    ctx.putImageData(imgData, 0, 0);
+    return canvas;
+  } catch (e) {
+    console.warn('DOS EPS TIFF preview extraction notice:', e);
+    return null;
+  }
+}
+
+/**
  * Universal extractor combining XMP and Binary scanners
  */
 export function extractEmbeddedThumbnail(arrayBufferOrText: ArrayBuffer | string): string | null {
   if (typeof arrayBufferOrText === 'string') {
     const match = arrayBufferOrText.match(/<(?:xmpGImg|xapGImg):image[^>]*>([\s\S]*?)<\/(?:xmpGImg|xapGImg):image>/i);
     if (match && match[1]) {
-      const cleanBase64 = match[1].replace(/[\r\n\s]/g, '');
+      const cleanBase64 = cleanXmpBase64(match[1]);
       if (cleanBase64.length > 50) {
-        return `data:image/jpeg;base64,${cleanBase64}`;
+        const mime = cleanBase64.startsWith('iVBOR') ? 'image/png' : 'image/jpeg';
+        return `data:${mime};base64,${cleanBase64}`;
       }
     }
     return null;
@@ -233,8 +495,8 @@ export async function renderAiOrPdfToCanvas(
   const naturalViewport = page.getViewport({ scale: 1.0 });
 
   const maxNatural = Math.max(naturalViewport.width, naturalViewport.height);
-  const targetMax = Math.max(targetWidth, targetHeight, 2600);
-  const scale = Math.max(1, Math.min(4, targetMax / maxNatural));
+  const targetMax = Math.max(targetWidth, targetHeight, 3000);
+  const scale = Math.max(1, Math.min(6, targetMax / maxNatural));
 
   const viewport = page.getViewport({ scale });
 
@@ -296,7 +558,8 @@ export function hasVisiblePixels(canvas: HTMLCanvasElement): boolean {
 
 /**
  * Parses PostScript / EPS vector paths and renders them directly onto an HTML5 canvas.
- * Uses a token stream parser to handle multiple commands per line, CMYK, RGB, Grayscale, and curves.
+ * Handles Illustrator EPS operators, CMYK/RGB/Grayscale, curves (c/v/y), transforms (cm/q/Q),
+ * DOS EPS binary preambles, and preserves the document's natural aspect ratio.
  */
 export function renderPostScriptPathsToCanvas(
   psText: string,
@@ -304,9 +567,9 @@ export function renderPostScriptPathsToCanvas(
   targetH = 4000
 ): { canvas: HTMLCanvasElement; isTransparent: boolean } | null {
   try {
-    // 1. Find BoundingBox
-    let bbW = targetW;
-    let bbH = targetH;
+    // 1. Find BoundingBox before stripping prolog/comments (skipping `(atend)`)
+    let bbW = 0;
+    let bbH = 0;
     let bbx = 0;
     let bby = 0;
 
@@ -315,180 +578,422 @@ export function renderPostScriptPathsToCanvas(
       psText.match(/%%BoundingBox:\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)/i);
 
     if (bbMatch) {
-      bbx = parseFloat(bbMatch[1]);
-      bby = parseFloat(bbMatch[2]);
-      const urx = parseFloat(bbMatch[3]);
-      const ury = parseFloat(bbMatch[4]);
-      if (urx > bbx && ury > bby) {
-        bbW = urx - bbx;
-        bbH = ury - bby;
+      const x1 = parseFloat(bbMatch[1]);
+      const y1 = parseFloat(bbMatch[2]);
+      const x2 = parseFloat(bbMatch[3]);
+      const y2 = parseFloat(bbMatch[4]);
+      if (!isNaN(x1) && !isNaN(y1) && !isNaN(x2) && !isNaN(y2) && x2 > x1 && y2 > y1) {
+        bbx = x1;
+        bby = y1;
+        bbW = x2 - x1;
+        bbH = y2 - y1;
       }
     }
 
+    if (bbW <= 0 || bbH <= 0) {
+      bbx = 0;
+      bby = 0;
+      bbW = 1000;
+      bbH = 1000;
+    }
+
+    // Preserve exact BoundingBox aspect ratio within targetW x targetH
+    const maxTarget = Math.max(targetW, targetH);
+    const baseScale = Math.min(maxTarget / bbW, maxTarget / bbH);
+    const canvasW = Math.max(1, Math.round(bbW * baseScale));
+    const canvasH = Math.max(1, Math.round(bbH * baseScale));
+
+    // Strip DOS binary header before %!PS-Adobe if present
+    let workingText = psText;
+    const psStartIdx = workingText.indexOf('%!PS');
+    if (psStartIdx > 0 && psStartIdx < 524288) {
+      workingText = workingText.slice(psStartIdx);
+    }
+
+    // Strip bulky non-drawing blocks before tokenization so Prolog / private metadata don't exhaust tokens
+    workingText = workingText
+      .replace(/%%BeginProlog[\s\S]*?%%EndProlog/gi, ' ')
+      .replace(/%%BeginPreview[\s\S]*?%%EndPreview/gi, ' ')
+      .replace(/%AI9_PrivateDataBegin[\s\S]*?%AI9_PrivateDataEnd/gi, ' ')
+      .replace(/%[^\r\n]*/g, ' ');
+
+    // Lightweight PostScript tokenizer: skips string literals (...) and keeps numbers/operators
+    const tokens: string[] = [];
+    const len = workingText.length;
+    let idx = 0;
+    const maxTokens = 150000;
+
+    while (idx < len && tokens.length < maxTokens) {
+      const ch = workingText.charCodeAt(idx);
+      // Skip whitespace
+      if (ch <= 32) {
+        idx++;
+        continue;
+      }
+      // Skip PostScript string literal (...)
+      if (ch === 40) {
+        let depth = 1;
+        idx++;
+        while (idx < len && depth > 0) {
+          const c = workingText.charCodeAt(idx);
+          if (c === 92) {
+            idx += 2; // escaped char
+            continue;
+          }
+          if (c === 40) depth++;
+          else if (c === 41) depth--;
+          idx++;
+        }
+        continue;
+      }
+      // Delimiters [ ] { } < > /
+      if (ch === 91 || ch === 93 || ch === 123 || ch === 125) {
+        idx++;
+        continue;
+      }
+      let start = idx;
+      while (idx < len) {
+        const c = workingText.charCodeAt(idx);
+        if (c <= 32 || c === 40 || c === 41 || c === 91 || c === 93 || c === 123 || c === 125) {
+          break;
+        }
+        idx++;
+      }
+      if (idx > start) {
+        tokens.push(workingText.slice(start, idx));
+      }
+    }
+
+    if (tokens.length < 4) return null;
+
     const canvas = document.createElement('canvas');
-    canvas.width = targetW;
-    canvas.height = targetH;
+    canvas.width = canvasW;
+    canvas.height = canvasH;
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return null;
 
-    const scaleX = targetW / bbW;
-    const scaleY = targetH / bbH;
+    // Map PostScript user space (bottom-left origin) directly onto canvas
+    ctx.setTransform(baseScale, 0, 0, -baseScale, -bbx * baseScale, canvasH + bby * baseScale);
+    ctx.fillStyle = '#0f172a';
+    ctx.strokeStyle = '#0f172a';
+    ctx.lineWidth = Math.max(1 / baseScale, 1);
 
-    // PostScript coordinate mapper: (0,0) is bottom-left
-    const toCanvasX = (x: number) => (x - bbx) * scaleX;
-    const toCanvasY = (y: number) => targetH - (y - bby) * scaleY;
-
-    // Tokenize PostScript stream (ignoring comments)
-    const cleanPs = psText.replace(/%[^\r\n]*/g, ' ');
-    const tokens = cleanPs.trim().split(/\s+/);
-    if (tokens.length < 5) return null;
-
+    const numStack: number[] = [];
     let pathStarted = false;
     let currentX = 0;
     let currentY = 0;
     let paintedActions = 0;
 
-    ctx.fillStyle = '#0f172a';
-    ctx.strokeStyle = '#0f172a';
-    ctx.lineWidth = Math.max(1, Math.round(targetW / 1200));
+    const popN = (n: number): number[] | null => {
+      if (numStack.length < n) return null;
+      return numStack.splice(numStack.length - n, n);
+    };
 
-    const maxTokens = Math.min(tokens.length, 60000);
-    let i = 0;
-
-    while (i < maxTokens) {
+    for (let i = 0; i < tokens.length; i++) {
       const tok = tokens[i];
+      const firstChar = tok.charCodeAt(0);
 
-      // RGB Color: r g b rg OR r g b setrgbcolor
-      if ((tok === 'rg' || tok === 'setrgbcolor') && i >= 3) {
-        const r = Math.max(0, Math.min(255, Math.round(parseFloat(tokens[i - 3]) * 255)));
-        const g = Math.max(0, Math.min(255, Math.round(parseFloat(tokens[i - 2]) * 255)));
-        const b = Math.max(0, Math.min(255, Math.round(parseFloat(tokens[i - 1]) * 255)));
-        if (!isNaN(r) && !isNaN(g) && !isNaN(b)) {
-          ctx.fillStyle = `rgb(${r},${g},${b})`;
-          ctx.strokeStyle = `rgb(${r},${g},${b})`;
-        }
-      }
-      // CMYK Color: c m y k k OR c m y k K OR c m y k setcmykcolor
-      else if ((tok === 'k' || tok === 'K' || tok === 'setcmykcolor') && i >= 4) {
-        const c = Math.max(0, Math.min(1, parseFloat(tokens[i - 4])));
-        const m = Math.max(0, Math.min(1, parseFloat(tokens[i - 3])));
-        const y = Math.max(0, Math.min(1, parseFloat(tokens[i - 2])));
-        const k = Math.max(0, Math.min(1, parseFloat(tokens[i - 1])));
-        if (!isNaN(c) && !isNaN(m) && !isNaN(y) && !isNaN(k)) {
-          const r = Math.round(255 * (1 - c) * (1 - k));
-          const g = Math.round(255 * (1 - m) * (1 - k));
-          const b = Math.round(255 * (1 - y) * (1 - k));
-          ctx.fillStyle = `rgb(${r},${g},${b})`;
-          ctx.strokeStyle = `rgb(${r},${g},${b})`;
-        }
-      }
-      // Grayscale: val g OR val G OR val setgray
-      else if ((tok === 'g' || tok === 'G' || tok === 'setgray') && i >= 1) {
-        const gray = Math.max(0, Math.min(255, Math.round(parseFloat(tokens[i - 1]) * 255)));
-        if (!isNaN(gray)) {
-          ctx.fillStyle = `rgb(${gray},${gray},${gray})`;
-          ctx.strokeStyle = `rgb(${gray},${gray},${gray})`;
-        }
-      }
-      // Set line width: w OR setlinewidth
-      else if ((tok === 'w' || tok === 'setlinewidth') && i >= 1) {
-        const lw = parseFloat(tokens[i - 1]);
-        if (!isNaN(lw) && lw > 0) {
-          ctx.lineWidth = Math.max(1, lw * scaleX);
-        }
-      }
-      // Move to: x y m OR x y moveto
-      else if ((tok === 'm' || tok === 'moveto') && i >= 2) {
-        const x = parseFloat(tokens[i - 2]);
-        const y = parseFloat(tokens[i - 1]);
-        if (!isNaN(x) && !isNaN(y)) {
-          if (!pathStarted) {
-            ctx.beginPath();
-            pathStarted = true;
-          }
-          currentX = toCanvasX(x);
-          currentY = toCanvasY(y);
-          ctx.moveTo(currentX, currentY);
-        }
-      }
-      // Line to: x y l OR x y lineto
-      else if ((tok === 'l' || tok === 'lineto') && i >= 2) {
-        const x = parseFloat(tokens[i - 2]);
-        const y = parseFloat(tokens[i - 1]);
-        if (!isNaN(x) && !isNaN(y)) {
-          currentX = toCanvasX(x);
-          currentY = toCanvasY(y);
-          ctx.lineTo(currentX, currentY);
-        }
-      }
-      // Cubic Bezier: x1 y1 x2 y2 x3 y3 c OR curveto
-      else if ((tok === 'c' || tok === 'curveto') && i >= 6) {
-        const cp1x = toCanvasX(parseFloat(tokens[i - 6]));
-        const cp1y = toCanvasY(parseFloat(tokens[i - 5]));
-        const cp2x = toCanvasX(parseFloat(tokens[i - 4]));
-        const cp2y = toCanvasY(parseFloat(tokens[i - 3]));
-        const endx = toCanvasX(parseFloat(tokens[i - 2]));
-        const endy = toCanvasY(parseFloat(tokens[i - 1]));
-        if (!isNaN(cp1x) && !isNaN(cp1y) && !isNaN(cp2x) && !isNaN(cp2y) && !isNaN(endx) && !isNaN(endy)) {
-          ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, endx, endy);
-          currentX = endx;
-          currentY = endy;
-        }
-      }
-      // Close path: h OR closepath
-      else if (tok === 'h' || tok === 'closepath') {
-        ctx.closePath();
-      }
-      // Fill: f OR F OR fill
-      else if (tok === 'f' || tok === 'F' || tok === 'fill') {
-        if (pathStarted) {
-          ctx.fill();
-          paintedActions++;
-          pathStarted = false;
-        }
-      }
-      // Stroke: s OR S OR stroke
-      else if (tok === 's' || tok === 'S' || tok === 'stroke') {
-        if (pathStarted) {
-          ctx.stroke();
-          paintedActions++;
-          pathStarted = false;
-        }
-      }
-      // Fill and Stroke: b OR B
-      else if (tok === 'b' || tok === 'B') {
-        if (pathStarted) {
-          ctx.fill();
-          ctx.stroke();
-          paintedActions++;
-          pathStarted = false;
-        }
-      }
-      // Rectangle: x y w h re
-      else if (tok === 're' && i >= 4) {
-        const rx = toCanvasX(parseFloat(tokens[i - 4]));
-        const ry = toCanvasY(parseFloat(tokens[i - 3]) + parseFloat(tokens[i - 1]));
-        const rw = parseFloat(tokens[i - 2]) * scaleX;
-        const rh = parseFloat(tokens[i - 1]) * scaleY;
-        if (!isNaN(rx) && !isNaN(ry) && !isNaN(rw) && !isNaN(rh)) {
-          if (!pathStarted) {
-            ctx.beginPath();
-            pathStarted = true;
-          }
-          ctx.rect(rx, ry, Math.abs(rw), Math.abs(rh));
+      // Fast numeric check (digits, '.', '-', '+')
+      if (
+        (firstChar >= 48 && firstChar <= 57) ||
+        firstChar === 45 ||
+        firstChar === 43 ||
+        firstChar === 46
+      ) {
+        const val = parseFloat(tok);
+        if (!isNaN(val)) {
+          numStack.push(val);
+          if (numStack.length > 32) numStack.shift();
+          continue;
         }
       }
 
-      i++;
+      switch (tok) {
+        // Graphics state save / restore & transforms
+        case 'q':
+        case 'gsave':
+          ctx.save();
+          numStack.length = 0;
+          break;
+        case 'Q':
+        case 'grestore':
+          ctx.restore();
+          numStack.length = 0;
+          break;
+        case 'cm':
+        case 'concat': {
+          const vals = popN(6);
+          if (vals) {
+            ctx.transform(vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]);
+          }
+          numStack.length = 0;
+          break;
+        }
+
+        // Colors: RGB
+        case 'rg':
+        case 'xa': {
+          const vals = popN(3);
+          if (vals) {
+            const r = Math.max(0, Math.min(255, Math.round(vals[0] * 255)));
+            const g = Math.max(0, Math.min(255, Math.round(vals[1] * 255)));
+            const b = Math.max(0, Math.min(255, Math.round(vals[2] * 255)));
+            ctx.fillStyle = `rgb(${r},${g},${b})`;
+          }
+          numStack.length = 0;
+          break;
+        }
+        case 'RG':
+        case 'XA': {
+          const vals = popN(3);
+          if (vals) {
+            const r = Math.max(0, Math.min(255, Math.round(vals[0] * 255)));
+            const g = Math.max(0, Math.min(255, Math.round(vals[1] * 255)));
+            const b = Math.max(0, Math.min(255, Math.round(vals[2] * 255)));
+            ctx.strokeStyle = `rgb(${r},${g},${b})`;
+          }
+          numStack.length = 0;
+          break;
+        }
+        case 'setrgbcolor': {
+          const vals = popN(3);
+          if (vals) {
+            const r = Math.max(0, Math.min(255, Math.round(vals[0] * 255)));
+            const g = Math.max(0, Math.min(255, Math.round(vals[1] * 255)));
+            const b = Math.max(0, Math.min(255, Math.round(vals[2] * 255)));
+            const col = `rgb(${r},${g},${b})`;
+            ctx.fillStyle = col;
+            ctx.strokeStyle = col;
+          }
+          numStack.length = 0;
+          break;
+        }
+
+        // Colors: CMYK & Illustrator spot color (x / X)
+        case 'k':
+        case 'K':
+        case 'setcmykcolor': {
+          const vals = popN(4);
+          if (vals) {
+            const c = Math.max(0, Math.min(1, vals[0]));
+            const m = Math.max(0, Math.min(1, vals[1]));
+            const y = Math.max(0, Math.min(1, vals[2]));
+            const k = Math.max(0, Math.min(1, vals[3]));
+            const r = Math.round(255 * (1 - c) * (1 - k));
+            const g = Math.round(255 * (1 - m) * (1 - k));
+            const b = Math.round(255 * (1 - y) * (1 - k));
+            const col = `rgb(${r},${g},${b})`;
+            if (tok === 'k') ctx.fillStyle = col;
+            else if (tok === 'K') ctx.strokeStyle = col;
+            else {
+              ctx.fillStyle = col;
+              ctx.strokeStyle = col;
+            }
+          }
+          numStack.length = 0;
+          break;
+        }
+        case 'x':
+        case 'X': {
+          if (numStack.length >= 5) {
+            const vals = popN(5)!;
+            const tint = Math.max(0, Math.min(1, 1 - vals[4]));
+            const c = Math.max(0, Math.min(1, vals[0] * tint));
+            const m = Math.max(0, Math.min(1, vals[1] * tint));
+            const y = Math.max(0, Math.min(1, vals[2] * tint));
+            const k = Math.max(0, Math.min(1, vals[3] * tint));
+            const r = Math.round(255 * (1 - c) * (1 - k));
+            const g = Math.round(255 * (1 - m) * (1 - k));
+            const b = Math.round(255 * (1 - y) * (1 - k));
+            const col = `rgb(${r},${g},${b})`;
+            if (tok === 'x') ctx.fillStyle = col;
+            else ctx.strokeStyle = col;
+          }
+          numStack.length = 0;
+          break;
+        }
+
+        // Colors: Grayscale
+        case 'g':
+        case 'G':
+        case 'setgray': {
+          const vals = popN(1);
+          if (vals) {
+            const gray = Math.max(0, Math.min(255, Math.round(vals[0] * 255)));
+            const col = `rgb(${gray},${gray},${gray})`;
+            if (tok === 'g') ctx.fillStyle = col;
+            else if (tok === 'G') ctx.strokeStyle = col;
+            else {
+              ctx.fillStyle = col;
+              ctx.strokeStyle = col;
+            }
+          }
+          numStack.length = 0;
+          break;
+        }
+
+        // Line width
+        case 'w':
+        case 'setlinewidth': {
+          const vals = popN(1);
+          if (vals && vals[0] > 0) {
+            ctx.lineWidth = Math.max(1 / baseScale, vals[0]);
+          }
+          numStack.length = 0;
+          break;
+        }
+
+        // Path construction
+        case 'm':
+        case 'moveto': {
+          const vals = popN(2);
+          if (vals) {
+            if (!pathStarted) {
+              ctx.beginPath();
+              pathStarted = true;
+            }
+            currentX = vals[0];
+            currentY = vals[1];
+            ctx.moveTo(currentX, currentY);
+          }
+          numStack.length = 0;
+          break;
+        }
+        case 'l':
+        case 'L':
+        case 'lineto': {
+          const vals = popN(2);
+          if (vals) {
+            if (!pathStarted) {
+              ctx.beginPath();
+              pathStarted = true;
+            }
+            currentX = vals[0];
+            currentY = vals[1];
+            ctx.lineTo(currentX, currentY);
+          }
+          numStack.length = 0;
+          break;
+        }
+        case 'c':
+        case 'C':
+        case 'curveto': {
+          const vals = popN(6);
+          if (vals) {
+            if (!pathStarted) {
+              ctx.beginPath();
+              pathStarted = true;
+            }
+            ctx.bezierCurveTo(vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]);
+            currentX = vals[4];
+            currentY = vals[5];
+          }
+          numStack.length = 0;
+          break;
+        }
+        case 'v':
+        case 'V': {
+          // Illustrator Bezier shorthand: first control point = current point
+          const vals = popN(4);
+          if (vals) {
+            if (!pathStarted) {
+              ctx.beginPath();
+              pathStarted = true;
+            }
+            ctx.bezierCurveTo(currentX, currentY, vals[0], vals[1], vals[2], vals[3]);
+            currentX = vals[2];
+            currentY = vals[3];
+          }
+          numStack.length = 0;
+          break;
+        }
+        case 'y':
+        case 'Y': {
+          // Illustrator Bezier shorthand: second control point = end point
+          const vals = popN(4);
+          if (vals) {
+            if (!pathStarted) {
+              ctx.beginPath();
+              pathStarted = true;
+            }
+            ctx.bezierCurveTo(vals[0], vals[1], vals[2], vals[3], vals[2], vals[3]);
+            currentX = vals[2];
+            currentY = vals[3];
+          }
+          numStack.length = 0;
+          break;
+        }
+        case 're': {
+          const vals = popN(4);
+          if (vals) {
+            if (!pathStarted) {
+              ctx.beginPath();
+              pathStarted = true;
+            }
+            ctx.rect(vals[0], vals[1], vals[2], vals[3]);
+          }
+          numStack.length = 0;
+          break;
+        }
+        case 'h':
+        case 'H':
+        case 'closepath':
+          if (pathStarted) ctx.closePath();
+          numStack.length = 0;
+          break;
+
+        // Path painting
+        case 'f':
+        case 'F':
+        case 'f*':
+        case 'fill':
+        case 'eofill':
+          if (pathStarted) {
+            if (tok === 'f') ctx.closePath();
+            ctx.fill(tok === 'f*' || tok === 'eofill' ? 'evenodd' : 'nonzero');
+            paintedActions++;
+            pathStarted = false;
+          }
+          numStack.length = 0;
+          break;
+        case 's':
+        case 'S':
+        case 'stroke':
+          if (pathStarted) {
+            if (tok === 's') ctx.closePath();
+            ctx.stroke();
+            paintedActions++;
+            pathStarted = false;
+          }
+          numStack.length = 0;
+          break;
+        case 'b':
+        case 'B':
+        case '*b':
+        case '*B':
+          if (pathStarted) {
+            if (tok === 'b' || tok === '*b') ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
+            paintedActions++;
+            pathStarted = false;
+          }
+          numStack.length = 0;
+          break;
+        case 'n':
+        case 'N':
+        case 'newpath':
+          pathStarted = false;
+          numStack.length = 0;
+          break;
+        default:
+          // Reset stack on unknown operators so stale numbers don't corrupt later commands
+          numStack.length = 0;
+          break;
+      }
     }
 
-    // Ensure last open path is painted
-    if (pathStarted) {
-      ctx.stroke();
-      paintedActions++;
-    }
-
-    // Verify whether actual visible pixels were drawn
+    // Only verify whether actual visible pixels were drawn
     if (paintedActions > 0 && hasVisiblePixels(canvas)) {
       return {
         canvas,
@@ -855,22 +1360,25 @@ export function canvasToPostScriptColorImage(
   const imgData = ctx.getImageData(0, 0, targetW, targetH);
   const data = imgData.data;
 
-  // Build standard hex string for 24-bit RGB
-  let hexData = '';
-  const hexChars = '0123456789abcdef';
+  // Build standard hex string for 24-bit RGB using lookup table + chunked array join (10x+ faster)
+  const hexTable = new Array<string>(256);
+  for (let n = 0; n < 256; n++) {
+    hexTable[n] = n.toString(16).padStart(2, '0');
+  }
 
-  for (let i = 0; i < data.length; i += 4) {
-    const r = data[i];
-    const g = data[i + 1];
-    const b = data[i + 2];
-    hexData += hexChars[(r >> 4) & 15] + hexChars[r & 15];
-    hexData += hexChars[(g >> 4) & 15] + hexChars[g & 15];
-    hexData += hexChars[(b >> 4) & 15] + hexChars[b & 15];
-
-    if ((i / 4) % 36 === 35) {
-      hexData += '\n';
+  const totalPixels = data.length >> 2;
+  const rows: string[] = [];
+  let lineBuf = '';
+  for (let p = 0; p < totalPixels; p++) {
+    const idx = p << 2;
+    lineBuf += hexTable[data[idx]] + hexTable[data[idx + 1]] + hexTable[data[idx + 2]];
+    if (p % 36 === 35) {
+      rows.push(lineBuf);
+      lineBuf = '';
     }
   }
+  if (lineBuf) rows.push(lineBuf);
+  const hexData = rows.join('\n');
 
   const lineBytes = targetW * 3;
 
@@ -1008,30 +1516,54 @@ export async function injectJfif300Dpi(jpegBlob: Blob, dpi = 300): Promise<Blob>
 
 
 /**
- * Universal vector preview loader: handles AI, EPS, SVG, and raster formats seamlessly.
- * NEVER fails and NEVER produces broken image icons.
+ * Universal vector preview loader: handles AI, EPS, PDF, SVG, and raster formats seamlessly.
  */
-export async function loadVectorPreview(file: File): Promise<VectorPreviewInfo> {
+export async function loadVectorPreview(
+  file: File,
+  options: { maxDimension?: number } = {}
+): Promise<VectorPreviewInfo> {
   const ext = file.name.split('.').pop()?.toLowerCase() || '';
   const baseName = sanitizeFileName(file.name);
+  const maxDim = options.maxDimension || 3000;
 
-  // 1. Adobe Illustrator (.ai) files
-  if (ext === 'ai') {
+  const decodePsTextWithBounds = (buffer: ArrayBuffer): string => {
+    const decoder = new TextDecoder('latin1');
+    const bytes = new Uint8Array(buffer);
+    const limit = Math.min(bytes.length, 6291456); // up to 6MB
+    let text = decoder.decode(bytes.subarray(0, limit));
+    // If BoundingBox is at the end (e.g. %%BoundingBox: (atend)), prepend tail header comments
+    if (
+      bytes.length > limit &&
+      !/%%(?:HiRes)?BoundingBox:\s*[-\d.]+/i.test(text.slice(0, 65536))
+    ) {
+      const tailText = decoder.decode(bytes.subarray(Math.max(0, bytes.length - 65536)));
+      const tailMatch = tailText.match(/%%(?:HiRes)?BoundingBox:\s*[-\d.]+\s+[-\d.]+\s+[-\d.]+\s+[-\d.]+/i);
+      if (tailMatch) {
+        text = `${tailMatch[0]}\n${text}`;
+      }
+    }
+    return text;
+  };
+
+  // 1. Adobe Illustrator (.ai) and PDF (.pdf) files
+  if (ext === 'ai' || ext === 'pdf') {
     const buffer = await file.arrayBuffer();
+    const label = ext === 'pdf' ? 'PDF Vector (.pdf)' : 'Adobe Illustrator (.ai)';
 
     // Strategy A: Render via PDF.js if PDF stream is present
     try {
-      const rendered = await renderAiOrPdfToCanvas(buffer, 3000, 3000);
+      const rendered = await renderAiOrPdfToCanvas(buffer, maxDim, maxDim);
       return {
         previewUrl: rendered.canvas.toDataURL('image/png'),
         canvas: rendered.canvas,
         width: rendered.width,
         height: rendered.height,
         isTransparent: rendered.isTransparent,
-        sourceType: 'Adobe Illustrator (.ai)'
+        sourceType: label,
+        isPlaceholder: false
       };
     } catch (pdfErr) {
-      console.warn('PDF.js render failed for .ai, trying thumbnail / PS paths:', pdfErr);
+      console.warn(`PDF.js render failed for .${ext}, trying thumbnail / PS paths:`, pdfErr);
     }
 
     // Strategy B: Embedded XMP or binary JPEG thumbnail
@@ -1040,8 +1572,8 @@ export async function loadVectorPreview(file: File): Promise<VectorPreviewInfo> 
       try {
         const img = await loadImage(thumb);
         const isTransparent = detectTransparency(img);
-        const w = img.naturalWidth || 3000;
-        const h = img.naturalHeight || 3000;
+        const w = img.naturalWidth || maxDim;
+        const h = img.naturalHeight || maxDim;
         const c = document.createElement('canvas');
         c.width = w;
         c.height = h;
@@ -1052,7 +1584,8 @@ export async function loadVectorPreview(file: File): Promise<VectorPreviewInfo> 
           width: w,
           height: h,
           isTransparent,
-          sourceType: 'Adobe Illustrator (.ai)'
+          sourceType: label,
+          isPlaceholder: false
         };
       } catch (imgErr) {
         console.warn('Could not load extracted thumbnail:', imgErr);
@@ -1060,33 +1593,36 @@ export async function loadVectorPreview(file: File): Promise<VectorPreviewInfo> 
     }
 
     // Strategy C: Parse PostScript vector paths
-    try {
-      const decoder = new TextDecoder('latin1');
-      const text = decoder.decode(new Uint8Array(buffer.slice(0, Math.min(buffer.byteLength, 2097152))));
-      const psRender = renderPostScriptPathsToCanvas(text, 3000, 3000);
-      if (psRender) {
-        return {
-          previewUrl: psRender.canvas.toDataURL('image/png'),
-          canvas: psRender.canvas,
-          width: 3000,
-          height: 3000,
-          isTransparent: psRender.isTransparent,
-          sourceType: 'Adobe Illustrator (.ai)'
-        };
+    if (ext === 'ai') {
+      try {
+        const text = decodePsTextWithBounds(buffer);
+        const psRender = renderPostScriptPathsToCanvas(text, maxDim, maxDim);
+        if (psRender) {
+          return {
+            previewUrl: psRender.canvas.toDataURL('image/png'),
+            canvas: psRender.canvas,
+            width: psRender.canvas.width,
+            height: psRender.canvas.height,
+            isTransparent: psRender.isTransparent,
+            sourceType: label,
+            isPlaceholder: false
+          };
+        }
+      } catch (psErr) {
+        console.warn('PS path parsing error:', psErr);
       }
-    } catch (psErr) {
-      console.warn('PS path parsing error:', psErr);
     }
 
-    // Strategy D: Guaranteed stylized vector presentation card
-    const cardCanvas = generateVectorArtCardCanvas(baseName, 3000, 3000, 'Adobe Illustrator (.ai)');
+    // Strategy D: Stylized vector presentation card (marked as placeholder)
+    const cardCanvas = generateVectorArtCardCanvas(baseName, maxDim, maxDim, label);
     return {
       previewUrl: cardCanvas.toDataURL('image/png'),
       canvas: cardCanvas,
-      width: 4000,
-      height: 4000,
+      width: cardCanvas.width,
+      height: cardCanvas.height,
       isTransparent: false,
-      sourceType: 'Adobe Illustrator (.ai)'
+      sourceType: label,
+      isPlaceholder: true
     };
   }
 
@@ -1094,73 +1630,174 @@ export async function loadVectorPreview(file: File): Promise<VectorPreviewInfo> 
   if (ext === 'eps') {
     const buffer = await file.arrayBuffer();
 
-    // Strategy A: Embedded XMP or binary JPEG thumbnail
-    const thumb = extractEmbeddedThumbnail(buffer);
-    if (thumb) {
+    const getEpsBounds = (): { w: number; h: number } | null => {
       try {
-        const img = await loadImage(thumb);
-        const w = img.naturalWidth || 3000;
-        const h = img.naturalHeight || 3000;
-        const c = document.createElement('canvas');
-        c.width = w;
-        c.height = h;
-        c.getContext('2d')?.drawImage(img, 0, 0);
-        return {
-          previewUrl: thumb,
-          canvas: c,
-          width: w,
-          height: h,
-          isTransparent: detectTransparency(img),
-          sourceType: 'PostScript Vector (.eps)'
-        };
-      } catch (e) {
-        console.warn('Could not load EPS thumbnail:', e);
+        const decoder = new TextDecoder('latin1');
+        const bytes = new Uint8Array(buffer);
+        const head = decoder.decode(bytes.subarray(0, Math.min(bytes.length, 65536)));
+        let bbMatch =
+          head.match(/%%HiResBoundingBox:\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)/i) ||
+          head.match(/%%BoundingBox:\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)/i);
+        if (!bbMatch && bytes.length > 65536) {
+          const tail = decoder.decode(bytes.subarray(Math.max(0, bytes.length - 65536)));
+          bbMatch =
+            tail.match(/%%HiResBoundingBox:\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)/i) ||
+            tail.match(/%%BoundingBox:\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)/i);
+        }
+        if (bbMatch) {
+          const bw = parseFloat(bbMatch[3]) - parseFloat(bbMatch[1]);
+          const bh = parseFloat(bbMatch[4]) - parseFloat(bbMatch[2]);
+          if (bw > 0 && bh > 0) return { w: bw, h: bh };
+        }
+      } catch {
+        // ignore header parse errors
       }
-    }
+      return null;
+    };
 
-    // Strategy B: PDF.js if EPS has embedded PDF stream
+    const upscaleSmallPreviewCanvas = (
+      source: HTMLImageElement | HTMLCanvasElement,
+      srcW: number,
+      srcH: number,
+      bounds: { w: number; h: number } | null
+    ): { canvas: HTMLCanvasElement; width: number; height: number } => {
+      let targetW = srcW;
+      let targetH = srcH;
+      const maxSrc = Math.max(srcW, srcH);
+
+      if (maxSrc < 1200) {
+        if (bounds && bounds.w > maxSrc && bounds.h > maxSrc) {
+          const srcRatio = srcW / srcH;
+          const bbRatio = bounds.w / bounds.h;
+          // Preserve artboard BoundingBox size when aspect ratios align, otherwise scale cleanly by thumbnail ratio
+          if (Math.abs(srcRatio - bbRatio) / Math.max(srcRatio, bbRatio) < 0.15) {
+            const fitScale = Math.min(maxDim / bounds.w, maxDim / bounds.h, 1);
+            targetW = Math.round(bounds.w * (bounds.w > maxDim || bounds.h > maxDim ? fitScale : 1));
+            targetH = Math.round(bounds.h * (bounds.w > maxDim || bounds.h > maxDim ? fitScale : 1));
+          } else {
+            const boost = Math.min(maxDim, 1400) / maxSrc;
+            targetW = Math.round(srcW * boost);
+            targetH = Math.round(srcH * boost);
+          }
+        } else {
+          const boost = Math.min(maxDim, 1400) / maxSrc;
+          targetW = Math.round(srcW * boost);
+          targetH = Math.round(srcH * boost);
+        }
+      }
+
+      const c = document.createElement('canvas');
+      c.width = Math.max(1, targetW);
+      c.height = Math.max(1, targetH);
+      const ctx = c.getContext('2d');
+      if (ctx) {
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(source, 0, 0, c.width, c.height);
+      }
+      return { canvas: c, width: c.width, height: c.height };
+    };
+
+    const epsBounds = getEpsBounds();
+
+    // Strategy A: Render full-res embedded PDF stream when present (sharpest vector preview)
     try {
-      const rendered = await renderAiOrPdfToCanvas(buffer, 3000, 3000);
+      const rendered = await renderAiOrPdfToCanvas(buffer, maxDim, maxDim);
       return {
         previewUrl: rendered.canvas.toDataURL('image/png'),
         canvas: rendered.canvas,
         width: rendered.width,
         height: rendered.height,
         isTransparent: rendered.isTransparent,
-        sourceType: 'PostScript Vector (.eps)'
+        sourceType: 'PostScript Vector (.eps)',
+        isPlaceholder: false
       };
     } catch {
-      // ignore
+      // ignore if pure PostScript EPS without PDF stream
     }
 
-    // Strategy C: Parse PostScript vector paths
+    // Strategy B: Embedded XMP or binary JPEG thumbnail (scaled cleanly to full BoundingBox size if small)
+    const thumb = extractEmbeddedThumbnail(buffer);
+    if (thumb) {
+      try {
+        const img = await loadImage(thumb);
+        const rawW = img.naturalWidth || maxDim;
+        const rawH = img.naturalHeight || maxDim;
+        const scaled = upscaleSmallPreviewCanvas(img, rawW, rawH, epsBounds);
+        const isTransparent = detectTransparency(scaled.canvas);
+        return {
+          previewUrl: scaled.width > rawW ? scaled.canvas.toDataURL('image/png') : thumb,
+          canvas: scaled.canvas,
+          width: scaled.width,
+          height: scaled.height,
+          isTransparent,
+          sourceType: 'PostScript Vector (.eps)',
+          isPlaceholder: false
+        };
+      } catch (e) {
+        console.warn('Could not load EPS thumbnail:', e);
+      }
+    }
+
+    // Strategy C: Parse PostScript vector paths natively
     try {
-      const decoder = new TextDecoder('latin1');
-      const text = decoder.decode(new Uint8Array(buffer.slice(0, Math.min(buffer.byteLength, 2097152))));
-      const psRender = renderPostScriptPathsToCanvas(text, 3000, 3000);
+      const text = decodePsTextWithBounds(buffer);
+      const psRender = renderPostScriptPathsToCanvas(text, maxDim, maxDim);
       if (psRender) {
         return {
           previewUrl: psRender.canvas.toDataURL('image/png'),
           canvas: psRender.canvas,
-          width: 3000,
-          height: 3000,
+          width: psRender.canvas.width,
+          height: psRender.canvas.height,
           isTransparent: psRender.isTransparent,
-          sourceType: 'PostScript Vector (.eps)'
+          sourceType: 'PostScript Vector (.eps)',
+          isPlaceholder: false
         };
       }
     } catch (psErr) {
       console.warn('EPS path parsing error:', psErr);
     }
 
-    // Strategy D: Guaranteed stylized vector presentation card
-    const cardCanvas = generateVectorArtCardCanvas(baseName, 3000, 3000, 'PostScript Vector (.eps)');
+    // Strategy D1: DOS EPS binary embedded TIFF preview
+    const dosTiffCanvas = extractDosEpsTiffPreviewCanvas(buffer);
+    if (dosTiffCanvas && hasVisiblePixels(dosTiffCanvas)) {
+      const scaled = upscaleSmallPreviewCanvas(dosTiffCanvas, dosTiffCanvas.width, dosTiffCanvas.height, epsBounds);
+      return {
+        previewUrl: scaled.canvas.toDataURL('image/png'),
+        canvas: scaled.canvas,
+        width: scaled.width,
+        height: scaled.height,
+        isTransparent: detectTransparency(scaled.canvas),
+        sourceType: 'PostScript Vector (.eps)',
+        isPlaceholder: false
+      };
+    }
+
+    // Strategy D2: EPSI ASCII hex embedded preview
+    const epsiCanvas = extractEpsiPreviewCanvas(buffer);
+    if (epsiCanvas && hasVisiblePixels(epsiCanvas)) {
+      const scaled = upscaleSmallPreviewCanvas(epsiCanvas, epsiCanvas.width, epsiCanvas.height, epsBounds);
+      return {
+        previewUrl: scaled.canvas.toDataURL('image/png'),
+        canvas: scaled.canvas,
+        width: scaled.width,
+        height: scaled.height,
+        isTransparent: false,
+        sourceType: 'PostScript Vector (.eps)',
+        isPlaceholder: false
+      };
+    }
+
+    // Strategy E: Stylized vector presentation card (marked as placeholder)
+    const cardCanvas = generateVectorArtCardCanvas(baseName, maxDim, maxDim, 'PostScript Vector (.eps)');
     return {
       previewUrl: cardCanvas.toDataURL('image/png'),
       canvas: cardCanvas,
-      width: 4000,
-      height: 4000,
+      width: cardCanvas.width,
+      height: cardCanvas.height,
       isTransparent: false,
-      sourceType: 'PostScript Vector (.eps)'
+      sourceType: 'PostScript Vector (.eps)',
+      isPlaceholder: true
     };
   }
 
@@ -1290,17 +1927,20 @@ export async function convertFileToFreepikVectorPack(
     const previewInfo = await loadVectorPreview(fileOrUrl);
     isArtworkTransparent = previewInfo.isTransparent;
 
+    const aiW = options.targetWidth || previewInfo.width || 3000;
+    const aiH = options.targetHeight || previewInfo.height || 3000;
+
     if (previewInfo.canvas) {
       artworkCanvas = previewInfo.canvas;
     } else {
-      artworkCanvas = generateVectorArtCardCanvas(baseName, targetWidth, targetHeight, 'Adobe Illustrator (.ai)');
+      artworkCanvas = generateVectorArtCardCanvas(baseName, aiW, aiH, 'Adobe Illustrator (.ai)');
     }
 
     // Generate standard PostScript Level 2 colorimage EPS
     // Completely avoids %%AI8_CreatorVersion and %AI9_DataStream so Adobe Illustrator
     // opens the file directly onto the artboard with zero errors!
-    const psBody = canvasToPostScriptColorImage(artworkCanvas, targetWidth, targetHeight);
-    finalEpsBytes = buildCleanFreepikEps(baseName, targetWidth, targetHeight, psBody);
+    const psBody = canvasToPostScriptColorImage(artworkCanvas, aiW, aiH);
+    finalEpsBytes = buildCleanFreepikEps(baseName, aiW, aiH, psBody);
 
   } else if (fileExt === 'svg' || (typeof fileOrUrl === 'string' && fileOrUrl.startsWith('data:image/svg+xml'))) {
     // User uploaded an SVG vector file!
@@ -1309,7 +1949,18 @@ export async function convertFileToFreepikVectorPack(
     if (fileOrUrl instanceof File || fileOrUrl instanceof Blob) {
       svgContent = await fileOrUrl.text();
     } else if (typeof fileOrUrl === 'string' && fileOrUrl.startsWith('data:image/svg+xml')) {
-      svgContent = decodeURIComponent(fileOrUrl.split(',')[1]);
+      const commaIdx = fileOrUrl.indexOf(',');
+      const meta = commaIdx >= 0 ? fileOrUrl.slice(0, commaIdx) : '';
+      const payload = commaIdx >= 0 ? fileOrUrl.slice(commaIdx + 1) : '';
+      if (/;base64/i.test(meta)) {
+        svgContent = atob(payload);
+      } else {
+        try {
+          svgContent = decodeURIComponent(payload);
+        } catch {
+          svgContent = payload;
+        }
+      }
     }
 
     const { psCommands, width, height } = convertSvgToPostScriptBody(svgContent);
@@ -1338,8 +1989,8 @@ export async function convertFileToFreepikVectorPack(
     const img = await loadImage(fileOrUrl);
     isArtworkTransparent = detectTransparency(img);
 
-    const docW = options.targetWidth || 4000;
-    const docH = options.targetHeight || 4000;
+    const docW = options.targetWidth || img.naturalWidth || img.width || 4000;
+    const docH = options.targetHeight || img.naturalHeight || img.height || 4000;
 
     artworkCanvas = document.createElement('canvas');
     artworkCanvas.width = docW;

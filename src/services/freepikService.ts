@@ -74,13 +74,26 @@ export function loadImage(source: File | Blob | string): Promise<HTMLImageElemen
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.crossOrigin = 'anonymous';
-    img.onload = () => resolve(img);
-    img.onerror = (e) => reject(new Error('Failed to load image file: ' + e));
+    let objectUrl: string | null = null;
+
+    img.onload = () => {
+      if (objectUrl) {
+        setTimeout(() => URL.revokeObjectURL(objectUrl!), 3000);
+      }
+      resolve(img);
+    };
+    img.onerror = (e) => {
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+      }
+      reject(new Error('Failed to load image file: ' + e));
+    };
 
     if (typeof source === 'string') {
       img.src = source;
     } else {
-      img.src = URL.createObjectURL(source);
+      objectUrl = URL.createObjectURL(source);
+      img.src = objectUrl;
     }
   });
 }
@@ -249,7 +262,6 @@ export async function convertFileToFreepikPsdPack(
 
   const originalWidth = img.naturalWidth || img.width || 3600;
   const originalHeight = img.naturalHeight || img.height || 2400;
-  const aspectRatio = originalWidth / originalHeight;
 
   // 1. Preserve 100% original dimensions from uploaded file (Zero squashing / Zero distortion)
   let docWidth = options.targetWidth || originalWidth;
@@ -430,7 +442,7 @@ export async function convertFileToFreepikPsdPack(
     );
   });
 
-  const finalJpgBlob = await injectJfif300Dpi(rawJpgBlob);
+  const finalJpgBlob = await injectJfifDpi(rawJpgBlob, targetDpi);
 
   // 4. Bundle both files into a single Freepik Submission ZIP Archive
   const zip = new JSZip();

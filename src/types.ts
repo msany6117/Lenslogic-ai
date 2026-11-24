@@ -16,6 +16,7 @@ export interface GenerationSettings {
   prefix: string;
   suffix: string;
   negativeKeywords: string;
+  transparentBackground?: boolean;
   apiKeys: ApiKeyEntry[];
   activeKeyId: string | null;
   batchSpeed?: 'safe' | 'turbo';
