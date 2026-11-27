@@ -6,6 +6,15 @@ import dotenv from "dotenv";
 import fs from "fs";
 import crypto from "crypto";
 import { GoogleGenAI, ThinkingLevel, Type } from "@google/genai";
+import {
+  extractCleanUpstreamError as sharedExtractCleanUpstreamError,
+  generateGeminiMetadataWithRecovery,
+  generateGroqMetadataServer,
+  isAuthOrAccessError,
+  isQuotaOrRateError,
+  isTransientBusyError,
+  parseImageDataPayload,
+} from "./api/_geminiShared.js";
 
 dotenv.config();
 
@@ -546,38 +555,14 @@ async function startServer() {
     const isTransparent = Boolean(settings?.transparentBackground);
     const { extUpper, phrase } = getFormatLabel(fileExtension, assetType, isTransparent);
 
-    return `
-      You are an elite Stock Marketplace SEO Strategist who ranks assets #1 on ${platform}, Shutterstock, and Freepik for maximum contributor downloads.
-      Analyze the image carefully and generate ultra-high-converting, buyer-intent metadata.
-
-      Asset Context:
-      - Target Marketplace: ${platform}
-      - Asset Type: ${assetType}
-      - File Format: ${extUpper} (${phrase})
-      - Title Length Target: ${titleLength} characters (strictly respect this length window).
-      - Keyword Count: Exactly ${keywordCount} keywords.
-      - Transparent Background Mode: ${isTransparent ? 'ENABLED (MANDATORY)' : 'AUTO-DETECT'}
-
-      Title SEO Rules (CRITICAL for top search ranking & downloads):
-      1. Front-load the most-searched primary subject, action, and commercial concept in the FIRST 50 characters.
-      2. ALWAYS naturally include the asset/file format (${extUpper} / ${phrase}) inside the title so buyers filtering or searching for "${extUpper}" or "${assetType.toLowerCase()}" find this asset immediately.
-      3. Include visual style, mood, composition, or commercial use-case (e.g., flat minimalist, 3D render, vibrant gradient, marketing banner, UI icon) without robotic repetition.
-      ${isTransparent
-        ? `4. TRANSPARENT RULE (STRICT): This file has a transparent background. You MUST explicitly include "transparent" or "isolated on transparent background" in the title. NEVER write "white background", "on white", "isolated on white", or "white backdrop" anywhere in the title, description, or keywords.`
-        : `4. Background Rule: Only describe a white background if it is visibly solid white; if isolated or transparent, state "isolated on transparent background" or "isolated graphic".`}
-      ${settings?.prefix ? `5. Title Prefix context: Start naturally with or accommodate prefix "${settings.prefix}".` : ''}
-      ${settings?.suffix ? `6. Title Suffix context: End naturally with or accommodate suffix "${settings.suffix}".` : ''}
-
-      Keyword SEO Rules (Ordered strictly by search weight — strongest 10 keywords FIRST):
-      1. Top 10 keywords MUST be the highest-volume exact-match subject, style, and main commercial concept terms.
-      2. Remaining keywords MUST blend high-converting buyer-intent phrases, commercial use-cases (branding, web design, poster, banner, marketing, presentation, template), color/mood/lighting descriptors, and format/asset tags (${extUpper.toLowerCase()}, ${assetType.toLowerCase()}).
-      ${isTransparent
-        ? `3. TRANSPARENT & PNG KEYWORDS REQUIRED: Include high-traffic transparent keywords ("transparent", "transparent background", "png", "isolated", "cutout", "no background", "alpha channel") among the keywords. Exclude any "white background" keywords.`
-        : ''}
-      4. Exclude weak filler words ("nice", "good", "file", "picture"), duplicates, and prohibited terms: ${settings?.negativeKeywords || 'None'}.
-
-      Output strictly valid JSON with keys: "title", "description", "keywords" (array of ${keywordCount} unique SEO keywords).
-    `;
+    return `Stock SEO strategist for ${platform}. Analyze image & return JSON: {"title","description","keywords"}.
+Context: Type=${assetType}, Format=${extUpper} (${phrase}), TitleLen=${titleLength} chars, Keywords=${keywordCount} exact, Transparent=${isTransparent ? 'MANDATORY' : 'AUTO'}.
+Title rules: Front-load top commercial subject in first 50 chars; include ${extUpper}/${phrase}; ${isTransparent
+      ? 'MUST include "transparent" or "isolated on transparent background", NEVER mention "white background".'
+      : 'Note "transparent background" if transparent, or "white background" only if solid white.'}${settings?.prefix ? ` Start with "${settings.prefix}".` : ''}${settings?.suffix ? ` End with "${settings.suffix}".` : ''}
+Keyword rules: Top 10 highest-volume subject/style terms first, then buyer use-cases, mood, format (${extUpper.toLowerCase()}, ${assetType.toLowerCase()}).${isTransparent
+      ? ' Include "transparent","transparent background","png","isolated","cutout","no background"; exclude white background.'
+      : ''} No duplicates, weak fillers, or: ${settings?.negativeKeywords || 'None'}.`;
   }
 
   function sanitizeTransparentAndFormat(result: any, settings: any, assetType: string = 'Photo', fileExtension?: string) {
@@ -678,12 +663,12 @@ async function startServer() {
   // --- FAST AI METADATA GENERATION ENDPOINT ---
   app.post("/api/generate-metadata", async (req, res) => {
     try {
-      const { base64Image, settings, apiKey, assetType, fileExtension } = req.body || {};
+      const { base64Image, settings, apiKey, provider, assetType, fileExtension } = req.body || {};
 
       const customKey = typeof apiKey === 'string' ? apiKey.trim() : '';
       if (!customKey) {
         return res.status(400).json({ 
-          error: "API key required. Please add your Gemini API key in AI Configuration." 
+          error: "API key required. Please add your Gemini or Groq API key in AI Configuration." 
         });
       }
 
@@ -693,153 +678,54 @@ async function startServer() {
         });
       }
 
-      let mimeType = 'image/jpeg';
-      let data = '';
-      if (base64Image.startsWith('data:')) {
-        const commaIdx = base64Image.indexOf(',');
-        const header = commaIdx >= 0 ? base64Image.slice(0, commaIdx) : base64Image;
-        data = commaIdx >= 0 ? base64Image.slice(commaIdx + 1).trim() : '';
-        const detected = header.match(/data:([^;]+);/i)?.[1]?.toLowerCase() || 'image/jpeg';
-        if (detected === 'image/svg+xml') {
-          return res.status(400).json({
-            error: "SVG image must be rasterized to PNG/JPEG before AI analysis."
-          });
-        }
-        const allowedMimes = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif']);
-        mimeType = allowedMimes.has(detected) ? detected : 'image/jpeg';
-      } else {
-        data = base64Image.trim();
-      }
+      const { mimeType, data } = parseImageDataPayload(base64Image);
+      const dataUri = base64Image.startsWith('data:')
+        ? base64Image.trim()
+        : `data:${mimeType};base64,${data}`;
 
-      if (!data || data.length < 16) {
-        return res.status(400).json({
-          error: "Image payload is empty or corrupted. Please try re-uploading the asset."
-        });
-      }
-
-      const ai = getAiClient(customKey);
       const prompt = buildSeoPrompt(settings || {}, assetType || 'Photo', fileExtension);
       const keywordCount = Number(settings?.keywordCount) || 30;
 
-      // Always try the user's key with zero persistent lockouts: Hydrogen -> Flash-Lite -> exponential backoff retries
-      const attemptSchedule: Array<{ model: string; thinkingLevel?: ThinkingLevel; delayBeforeMs: number; timeoutMs: number }> = [
-        { model: "gemini-4-hydrogen", thinkingLevel: ThinkingLevel.LOW, delayBeforeMs: 0, timeoutMs: 8000 },
-        { model: "gemini-3.1-flash-lite", delayBeforeMs: 0, timeoutMs: 11000 },
-        { model: "gemini-4-hydrogen", thinkingLevel: ThinkingLevel.LOW, delayBeforeMs: 1100, timeoutMs: 11000 },
-        { model: "gemini-3.1-flash-lite", delayBeforeMs: 1800, timeoutMs: 12000 },
-      ];
-
-      let response: any = null;
-      let lastErr: any = null;
-      let primaryModelErr: any = null;
-      let skipPrimaryForRequest = false;
-
-      for (let idx = 0; idx < attemptSchedule.length; idx++) {
-        const baseCfg = attemptSchedule[idx];
-        const cfg =
-          skipPrimaryForRequest && baseCfg.model === "gemini-4-hydrogen"
-            ? { ...baseCfg, model: "gemini-3.1-flash-lite", thinkingLevel: undefined }
-            : baseCfg;
-
-        if (idx > 0 && cfg.delayBeforeMs > 0) {
-          const jitter = Math.floor(Math.random() * 350);
-          await new Promise(resolve => setTimeout(resolve, cfg.delayBeforeMs + jitter));
-        }
-        try {
-          response = await ai.models.generateContent({
-            model: cfg.model,
-            contents: {
-              parts: [
-                { text: prompt },
-                {
-                  inlineData: {
-                    data,
-                    mimeType
-                  }
-                }
-              ]
-            },
-            config: {
-              ...(cfg.thinkingLevel ? { thinkingConfig: { thinkingLevel: cfg.thinkingLevel } } : {}),
-              abortSignal: AbortSignal.timeout(cfg.timeoutMs),
-              responseMimeType: "application/json",
-              responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                  title: {
-                    type: Type.STRING,
-                    description: `High-ranking SEO stock title optimized for downloads.`
-                  },
-                  description: {
-                    type: Type.STRING,
-                    description: "A clear semantic description for stock search indexing."
-                  },
-                  keywords: {
-                    type: Type.ARRAY,
-                    items: { type: Type.STRING },
-                    description: `A flat array of exactly ${keywordCount} keywords ordered by search relevance.`
-                  }
-                },
-                required: ["title", "description", "keywords"]
-              }
-            }
+      const useGroq = provider === 'Groq' || customKey.startsWith('gsk_');
+      const result = useGroq
+        ? await generateGroqMetadataServer({
+            base64Image: dataUri,
+            apiKey: customKey,
+            prompt,
+            settings: settings || {},
+            assetType: assetType || 'Photo',
+            fileExtension,
+            isServerless: false,
+          })
+        : await generateGeminiMetadataWithRecovery({
+            apiKey: customKey,
+            data,
+            mimeType,
+            prompt,
+            keywordCount,
+            settings: settings || {},
+            assetType: assetType || 'Photo',
+            fileExtension,
+            isServerless: false,
           });
-          if (response?.text) {
-            break;
-          }
-        } catch (e: any) {
-          lastErr = e;
-          const rawMsg = String(e?.message || e || '');
-          const upper = rawMsg.toUpperCase();
-          if (
-            cfg.model === "gemini-4-hydrogen" &&
-            !upper.includes('503') &&
-            !upper.includes('UNAVAILABLE') &&
-            !upper.includes('ABORT') &&
-            !upper.includes('TIMEOUT')
-          ) {
-            primaryModelErr = e;
-          }
-          if (
-            cfg.model === "gemini-4-hydrogen" &&
-            (/GenerateRequestsPerDay|limit:\s*0\b/i.test(rawMsg) || upper.includes('429'))
-          ) {
-            skipPrimaryForRequest = true;
-          }
-
-          if (
-            upper.includes('API_KEY_INVALID') ||
-            upper.includes('API KEY NOT VALID') ||
-            upper.includes('PERMISSION_DENIED') ||
-            upper.includes('403') ||
-            upper.includes('INVALID_ARGUMENT')
-          ) {
-            break;
-          }
-        }
-      }
-
-      if (!response || !response.text) {
-        throw primaryModelErr || lastErr || new Error("No response returned from Gemini API");
-      }
-
-      const parsed = safeParseJsonObject(response.text);
-      const result = sanitizeTransparentAndFormat(parsed, settings || {}, assetType || 'Photo', fileExtension);
 
       res.json(result);
     } catch (err: any) {
-      const raw = String(err?.message || '');
-      const cleanMsg = extractCleanUpstreamError(err, "AI metadata generation failed");
-      const isBusy503 = raw.includes('503') || raw.includes('UNAVAILABLE') || raw.includes('high demand');
-      const isQuota429 = raw.includes('429') || raw.includes('RESOURCE_EXHAUSTED');
-      const isAuth403 = raw.includes('API_KEY_INVALID') || raw.includes('PERMISSION_DENIED') || raw.includes('403');
-      const status = isQuota429 || isBusy503 ? 429 : isAuth403 ? 401 : 500;
+      const cleanMsg = sharedExtractCleanUpstreamError(err, "AI metadata generation failed");
+      const explicitStatus = Number(err?.status || 0);
+      if (explicitStatus === 400) {
+        return res.status(400).json({ error: cleanMsg, upstreamStatus: 400 });
+      }
+      const isQuota429 = isQuotaOrRateError(err);
+      const isBusy503 = isTransientBusyError(err);
+      const isAuth403 = isAuthOrAccessError(err);
+      const status = isQuota429 ? 429 : isBusy503 ? 503 : isAuth403 ? 401 : 500;
       if (status === 500) {
         console.warn("Metadata generation error:", cleanMsg);
       }
       res.status(status).json({
         error: cleanMsg,
-        upstreamStatus: isQuota429 ? 429 : isBusy503 ? 503 : isAuth403 ? 403 : 500
+        upstreamStatus: isQuota429 ? 429 : isBusy503 ? 503 : isAuth403 ? (explicitStatus || 403) : 500
       });
     }
   });

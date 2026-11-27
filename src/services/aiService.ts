@@ -25,38 +25,54 @@ export function buildSeoPrompt(settings: GenerationSettings, assetType: AssetTyp
   const isTransparent = Boolean(settings.transparentBackground);
   const { extUpper, phrase } = getFormatLabel(fileExtension, assetType, isTransparent);
 
-  return `
-    You are an elite Stock Marketplace SEO Strategist who ranks assets #1 on ${settings.platform}, Shutterstock, and Freepik for maximum contributor downloads.
-    Analyze the image carefully and generate ultra-high-converting, buyer-intent metadata.
+  return `Stock SEO strategist for ${settings.platform}. Analyze image & return JSON: {"title","description","keywords"}.
+Context: Type=${assetType}, Format=${extUpper} (${phrase}), TitleLen=${settings.titleLength} chars, Keywords=${settings.keywordCount} exact, Transparent=${isTransparent ? 'MANDATORY' : 'AUTO'}.
+Title rules: Front-load top commercial subject in first 50 chars; include ${extUpper}/${phrase}; ${isTransparent ? 'MUST include "transparent" or "isolated on transparent background", NEVER mention "white background".' : 'Note "transparent background" if transparent, or "white background" only if solid white.'}${settings.prefix ? ` Start with "${settings.prefix}".` : ''}${settings.suffix ? ` End with "${settings.suffix}".` : ''}
+Keyword rules: Top 10 highest-volume subject/style terms first, then buyer use-cases, mood, format (${extUpper.toLowerCase()}, ${assetType.toLowerCase()}).${isTransparent ? ' Include "transparent","transparent background","png","isolated","cutout","no background"; exclude white background.' : ''} No duplicates, weak fillers, or: ${settings.negativeKeywords || 'None'}.`;
+}
 
-    Asset Context:
-    - Target Marketplace: ${settings.platform}
-    - Asset Type: ${assetType}
-    - File Format: ${extUpper} (${phrase})
-    - Title Length Target: ${settings.titleLength} characters (strictly respect this length window).
-    - Keyword Count: Exactly ${settings.keywordCount} keywords.
-    - Transparent Background Mode: ${isTransparent ? 'ENABLED (MANDATORY)' : 'AUTO-DETECT'}
+const keyHealthCooldown = new Map<string, number>();
 
-    Title SEO Rules (CRITICAL for top search ranking & downloads):
-    1. Front-load the most-searched primary subject, action, and commercial concept in the FIRST 50 characters.
-    2. ALWAYS naturally include the asset/file format (${extUpper} / ${phrase}) inside the title so buyers filtering or searching for "${extUpper}" or "${assetType.toLowerCase()}" find this asset immediately.
-    3. Include visual style, mood, composition, or commercial use-case without robotic repetition.
-    ${isTransparent
-      ? `4. TRANSPARENT RULE (STRICT): This file has a transparent background. You MUST explicitly include "transparent" or "isolated on transparent background" in the title. NEVER write "white background", "on white", "isolated on white", or "white backdrop" anywhere in the title, description, or keywords.`
-      : `4. Background Rule: Only describe a white background if it is visibly solid white; if isolated or transparent, state "isolated on transparent background" or "isolated graphic".`}
-    ${settings.prefix ? `5. Title Prefix context: Start naturally with or accommodate prefix "${settings.prefix}".` : ''}
-    ${settings.suffix ? `6. Title Suffix context: End naturally with or accommodate suffix "${settings.suffix}".` : ''}
+function getKeyTokenId(entry: ApiKeyEntry): string {
+  return entry.id || entry.key.trim();
+}
 
-    Keyword SEO Rules (Ordered strictly by search weight — strongest 10 keywords FIRST):
-    1. Top 10 keywords MUST be the highest-volume exact-match subject, style, and main commercial concept terms.
-    2. Remaining keywords MUST blend high-converting buyer-intent phrases, commercial use-cases, color/mood/lighting descriptors, and format/asset tags (${extUpper.toLowerCase()}, ${assetType.toLowerCase()}).
-    ${isTransparent
-      ? `3. TRANSPARENT & PNG KEYWORDS REQUIRED: Include high-traffic transparent keywords ("transparent", "transparent background", "png", "isolated", "cutout", "no background", "alpha channel") among the keywords. Exclude any "white background" keywords.`
-      : ''}
-    4. Exclude weak filler words ("nice", "good", "file", "picture"), duplicates, and prohibited terms: ${settings.negativeKeywords || 'None'}.
+export function isApiKeyHealthy(entry: ApiKeyEntry): boolean {
+  if (!entry?.key?.trim()) return false;
+  const until = keyHealthCooldown.get(getKeyTokenId(entry)) || 0;
+  return Date.now() >= until;
+}
 
-    Output strictly valid JSON with keys: "title", "description", "keywords" (array of ${settings.keywordCount} unique SEO keywords).
-  `;
+export function getHealthyApiKeys(keys: ApiKeyEntry[]): ApiKeyEntry[] {
+  const valid = (keys || []).filter((k) => Boolean(k?.key?.trim()));
+  if (valid.length === 0) return [];
+  const healthy = valid.filter(isApiKeyHealthy);
+  return healthy.length > 0 ? healthy : valid;
+}
+
+function markKeyCooldown(entry: ApiKeyEntry, durationMs: number) {
+  keyHealthCooldown.set(getKeyTokenId(entry), Date.now() + durationMs);
+}
+
+function clearKeyCooldown(entry: ApiKeyEntry) {
+  keyHealthCooldown.delete(getKeyTokenId(entry));
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err: any) {
+    if (err?.name === "AbortError") {
+      const timeoutErr = new Error("Request timed out under load. Switching to next available key or retrying...") as Error & { status?: number };
+      timeoutErr.status = 504;
+      throw timeoutErr;
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function generateMetadata(
@@ -64,15 +80,16 @@ export async function generateMetadata(
   settings: GenerationSettings,
   activeKey: ApiKeyEntry | null,
   assetType: AssetType = 'Photo',
-  fileExtension?: string
-): Promise<{ title: string; description: string; keywords: string[] }> {
+  fileExtension?: string,
+  onAutoSwitchKey?: (switchedKey: ApiKeyEntry, shouldPersist: boolean) => void
+): Promise<{ title: string; description: string; keywords: string[]; usedKeyId?: string }> {
   
   // Skip redundant re-compression only when caller already compressed image to a compact raster JPEG/PNG/WebP data URL
   let optimizedBase64 = base64Image;
   const isCompactRasterDataUrl = /^data:image\/(jpeg|png|webp);base64,/i.test(base64Image) && base64Image.length < 150000;
   if (!isCompactRasterDataUrl) {
     try {
-      const compressed = await compressImage(base64Image, 384, 384, 0.68);
+      const compressed = await compressImage(base64Image, 256, 256, 0.55);
       if (compressed) {
         optimizedBase64 = compressed;
       }
@@ -85,66 +102,39 @@ export async function generateMetadata(
     throw new Error("Could not encode image preview for AI analysis. Please attach a valid JPG or PNG preview.");
   }
 
-  // Collect user-provided keys per provider (active key first)
-  const orderedGeminiKeys: string[] = [];
-  if (activeKey?.provider === 'Gemini' && activeKey.key?.trim()) {
-    orderedGeminiKeys.push(activeKey.key.trim());
-  }
-  for (const entry of settings.apiKeys || []) {
-    const trimmed = entry?.provider === 'Gemini' ? entry.key?.trim() : '';
-    if (trimmed && !orderedGeminiKeys.includes(trimmed)) {
-      orderedGeminiKeys.push(trimmed);
-    }
-  }
-
-  const orderedGroqKeys: string[] = [];
-  if (activeKey?.provider === 'Groq' && activeKey.key?.trim()) {
-    orderedGroqKeys.push(activeKey.key.trim());
-  }
-  for (const entry of settings.apiKeys || []) {
-    const trimmed = entry?.provider === 'Groq' ? entry.key?.trim() : '';
-    if (trimmed && !orderedGroqKeys.includes(trimmed)) {
-      orderedGroqKeys.push(trimmed);
-    }
-  }
-
-  const runGroqFailover = async (prompt: string) => {
-    let lastGroqErr: any = null;
-    for (const groqKey of orderedGroqKeys) {
-      try {
-        return await callGroq(optimizedBase64, prompt, groqKey, settings, assetType, fileExtension);
-      } catch (err: any) {
-        lastGroqErr = err;
-      }
-    }
-    throw lastGroqErr || new Error("Groq metadata generation failed.");
+  // Build deduplicated list of ALL user-configured keys (Gemini + Groq)
+  const allValidEntries: ApiKeyEntry[] = [];
+  const seenKeys = new Set<string>();
+  const addEntry = (entry: ApiKeyEntry | null | undefined) => {
+    const trimmed = entry?.key?.trim();
+    if (!trimmed || seenKeys.has(trimmed)) return;
+    seenKeys.add(trimmed);
+    const inferredProvider = trimmed.startsWith('gsk_') ? 'Groq' : trimmed.startsWith('AIza') ? 'Gemini' : entry!.provider;
+    allValidEntries.push({ ...entry!, key: trimmed, provider: inferredProvider });
   };
 
-  // If the user explicitly has a Groq key active, try Groq keys first (with optional fallback to Gemini keys)
-  if (activeKey && activeKey.provider === 'Groq' && activeKey.key?.trim()) {
-    const prompt = buildSeoPrompt(settings, assetType, fileExtension);
-    try {
-      return await runGroqFailover(prompt);
-    } catch (groqErr: any) {
-      if (orderedGeminiKeys.length === 0) {
-        throw groqErr;
-      }
-    }
+  addEntry(activeKey);
+  for (const entry of settings.apiKeys || []) {
+    addEntry(entry);
   }
 
-  if (orderedGeminiKeys.length === 0) {
-    if (orderedGroqKeys.length > 0) {
-      const prompt = buildSeoPrompt(settings, assetType, fileExtension);
-      return await runGroqFailover(prompt);
-    }
+  if (allValidEntries.length === 0) {
     throw new Error("API key required. Please add your Gemini or Groq API key in AI Configuration.");
   }
 
-  const requestMetadataFromServer = async (geminiKey: string) => {
+  // Order keys: healthy keys of preferred provider first -> healthy keys of backup provider -> any temporarily cooled keys last
+  const preferredProvider = activeKey?.provider || allValidEntries[0].provider;
+  const healthySameProvider = allValidEntries.filter((e) => e.provider === preferredProvider && isApiKeyHealthy(e));
+  const healthyOtherProvider = allValidEntries.filter((e) => e.provider !== preferredProvider && isApiKeyHealthy(e));
+  const cooledFallback = allValidEntries.filter((e) => !isApiKeyHealthy(e));
+  const orderedEntries = [...healthySameProvider, ...healthyOtherProvider, ...cooledFallback];
+
+  const requestMetadataFromServer = async (keyValue: string, provider: 'Gemini' | 'Groq') => {
     const payload = JSON.stringify({
       base64Image: optimizedBase64,
       settings,
-      apiKey: geminiKey,
+      apiKey: keyValue,
+      provider,
       assetType,
       fileExtension
     });
@@ -160,19 +150,36 @@ export async function generateMetadata(
     for (let idx = 0; idx < candidateUrls.length; idx++) {
       const targetUrl = candidateUrls[idx];
       let response: Response | null = null;
+      let rawBody = "";
+      let contentType = "";
+      let isHtml = false;
 
       for (let netAttempt = 0; netAttempt < 2; netAttempt++) {
         try {
-          response = await fetch(targetUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: payload
-          });
+          response = await fetchWithTimeout(
+            targetUrl,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              credentials: targetUrl.startsWith("/") ? "same-origin" : "omit",
+              body: payload
+            },
+            19000
+          );
+          contentType = (response.headers.get("content-type") || "").toLowerCase();
+          rawBody = await response.text();
+          isHtml = contentType.includes("text/html") || /^\s*<!doctype|^\s*<html/i.test(rawBody);
+          if (isHtml && netAttempt === 0) {
+            await new Promise((resolve) => setTimeout(resolve, 450));
+            continue;
+          }
           break;
         } catch (networkErr: any) {
           lastFetchErr = networkErr instanceof Error ? networkErr : new Error("Network request failed");
-          if (netAttempt === 0) {
-            await new Promise((resolve) => setTimeout(resolve, 500));
+          if (netAttempt === 0 && Number((networkErr as any)?.status || 0) !== 504) {
+            await new Promise((resolve) => setTimeout(resolve, 350));
+          } else {
+            break;
           }
         }
       }
@@ -181,8 +188,6 @@ export async function generateMetadata(
         continue;
       }
 
-      const contentType = (response.headers.get("content-type") || "").toLowerCase();
-      const rawBody = await response.text();
       let parsedBody: any = null;
       if (rawBody) {
         try {
@@ -192,7 +197,6 @@ export async function generateMetadata(
         }
       }
 
-      const isHtml = contentType.includes("text/html") || /^\s*<!doctype|^\s*<html/i.test(rawBody);
       if (isHtml && idx < candidateUrls.length - 1) {
         continue;
       }
@@ -203,17 +207,21 @@ export async function generateMetadata(
           (isHtml
             ? `Server returned an HTML error page (HTTP ${response.status}). Please retry in a moment.`
             : `Server generation failed (Status: ${response.status})`);
-        const err = new Error(errorMessage) as Error & { status?: number };
+        const err = new Error(errorMessage) as Error & { status?: number; upstreamStatus?: number; isEndpointMissing?: boolean };
         err.status = response.status;
+        err.upstreamStatus = Number(parsedBody?.upstreamStatus || response.status);
+        err.isEndpointMissing = isHtml || response.status === 404;
         throw err;
       }
 
       if (!parsedBody) {
-        throw new Error(
+        const err = new Error(
           isHtml
-            ? "Metadata API endpoint returned HTML instead of JSON. Please refresh or ensure the backend server is running."
+            ? "Metadata API endpoint returned HTML instead of JSON. Please refresh (Ctrl+Shift+R) and ensure the /api backend is deployed."
             : "Invalid non-JSON response received from server metadata engine."
-        );
+        ) as Error & { isEndpointMissing?: boolean };
+        err.isEndpointMissing = isHtml;
+        throw err;
       }
 
       if (!parsedBody.title || !Array.isArray(parsedBody.keywords)) {
@@ -224,45 +232,142 @@ export async function generateMetadata(
     }
 
     if (lastFetchErr && /failed to fetch|network/i.test(lastFetchErr.message)) {
-      throw new Error("Could not reach the metadata server. Please check your connection or refresh the page and try again.");
+      const err = new Error("Could not reach the metadata server. Please check your connection or refresh the page and try again.") as Error & { isEndpointMissing?: boolean };
+      err.isEndpointMissing = true;
+      throw err;
     }
     throw lastFetchErr || new Error("Failed to reach metadata API endpoint.");
   };
 
+  let firstBusyError: any = null;
   let lastKeyError: any = null;
-  for (let i = 0; i < orderedGeminiKeys.length; i++) {
+  let sawPermanentFailureOnPriorKey = false;
+  const prompt = buildSeoPrompt(settings, assetType, fileExtension);
+
+  for (let i = 0; i < orderedEntries.length; i++) {
+    const entry = orderedEntries[i];
     try {
-      return await requestMetadataFromServer(orderedGeminiKeys[i]);
+      let result: { title: string; description: string; keywords: string[] };
+      if (entry.provider === 'Groq') {
+        try {
+          result = await requestMetadataFromServer(entry.key, 'Groq');
+        } catch (proxyErr: any) {
+          if (proxyErr?.isEndpointMissing) {
+            result = await callGroq(optimizedBase64, prompt, entry.key, settings, assetType, fileExtension);
+          } else {
+            throw proxyErr;
+          }
+        }
+      } else {
+        result = await requestMetadataFromServer(entry.key, 'Gemini');
+      }
+
+      clearKeyCooldown(entry);
+      if (entry.id && entry.id !== activeKey?.id) {
+        onAutoSwitchKey?.(entry, sawPermanentFailureOnPriorKey);
+      }
+      return { ...result, usedKeyId: entry.id };
     } catch (err: any) {
       lastKeyError = err;
-      const status = Number(err?.status || 0);
+      const status = Number(err?.upstreamStatus || err?.status || 0);
       const msg = String(err?.message || '').toLowerCase();
-      const isRetryableWithNextKey =
-        status === 429 ||
-        status === 503 ||
+
+      const isQuota429 = status === 429 || msg.includes('429') || msg.includes('quota') || msg.includes('rate limit');
+      const isAuth =
         status === 401 ||
         status === 403 ||
-        msg.includes('429') ||
-        msg.includes('503') ||
-        msg.includes('quota') ||
-        msg.includes('busy');
-      if (!isRetryableWithNextKey) {
+        msg.includes('invalid') ||
+        msg.includes('unauthorized') ||
+        msg.includes('api_key') ||
+        msg.includes('no vision') ||
+        msg.includes('do not have access');
+      const isBusy503 =
+        !isQuota429 &&
+        !isAuth &&
+        (status === 503 || status === 504 || msg.includes('503') || msg.includes('busy') || msg.includes('timed out') || msg.includes('aborted'));
+
+      if (isQuota429) {
+        markKeyCooldown(entry, 45000);
+        sawPermanentFailureOnPriorKey = true;
+      } else if (isAuth) {
+        markKeyCooldown(entry, 120000);
+        sawPermanentFailureOnPriorKey = true;
+      } else if (isBusy503) {
+        if (!firstBusyError) firstBusyError = err;
+        markKeyCooldown(entry, 6000);
+      }
+
+      const isSwitchable = isQuota429 || isBusy503 || isAuth || status === 500 || Boolean(err?.isEndpointMissing);
+      if (!isSwitchable || i === orderedEntries.length - 1) {
+        if (firstBusyError && err !== firstBusyError && isAuth) {
+          const combined = new Error(`${firstBusyError.message} (Backup key note: ${err.message})`) as Error & {
+            status?: number;
+            upstreamStatus?: number;
+          };
+          combined.status = Number(firstBusyError.status || 503);
+          combined.upstreamStatus = Number(firstBusyError.upstreamStatus || 503);
+          throw combined;
+        }
         throw err;
       }
     }
   }
 
-  // If all Gemini keys hit 503/429/auth and user also configured a Groq key, fail over cleanly to Groq
-  if (orderedGroqKeys.length > 0) {
-    try {
-      const prompt = buildSeoPrompt(settings, assetType, fileExtension);
-      return await runGroqFailover(prompt);
-    } catch {
-      // Surface the primary Gemini error if Groq fallback also fails
-    }
+  throw lastKeyError || new Error("Metadata generation failed.");
+}
+
+const groqVisionModelsCache = new Map<string, { models: string[]; expiresAt: number }>();
+
+async function resolveGroqVisionModels(apiKey: string): Promise<string[]> {
+  const cached = groqVisionModelsCache.get(apiKey);
+  if (cached && Date.now() < cached.expiresAt && cached.models.length > 0) {
+    return cached.models;
   }
 
-  throw lastKeyError || new Error("Metadata generation failed.");
+  const fallbackDefaults = ["qwen/qwen3.8-27b", "meta-models/muse-spark-open"];
+  const knownVisionOrder = [
+    "qwen/qwen3.8-27b",
+    "meta-models/muse-spark-open",
+  ];
+
+  try {
+    const res = await fetchWithTimeout(
+      "https://api.groq.com/openai/v1/models",
+      {
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+        },
+      },
+      3500
+    );
+    if (res.ok) {
+      const payload = await res.json();
+      const ids: string[] = Array.isArray(payload?.data)
+        ? payload.data.map((m: any) => String(m?.id || "")).filter(Boolean)
+        : [];
+      const excluded = /whisper|playai|tts|guard|safeguard|embed|orpheus|allam|compound/i;
+      const visionCandidates = ids.filter((id) =>
+        !excluded.test(id) &&
+        /(qwen3\.8|muse-spark|vision|\bvl\b|pixtral|llava|gemma-3|llama-4|multimodal|omni)/i.test(id)
+      );
+      if (visionCandidates.length > 0) {
+        const ordered = [
+          ...knownVisionOrder.filter((id) => visionCandidates.includes(id)),
+          ...visionCandidates.filter((id) => !knownVisionOrder.includes(id)),
+        ];
+        groqVisionModelsCache.set(apiKey, {
+          models: ordered,
+          expiresAt: Date.now() + 5 * 60 * 1000,
+        });
+        return ordered;
+      }
+    }
+  } catch {
+    // Fall back to curated defaults if model list fetch fails
+  }
+
+  return fallbackDefaults;
 }
 
 async function callGroq(
@@ -273,29 +378,29 @@ async function callGroq(
   assetType: AssetType = 'Photo',
   fileExtension?: string
 ) {
-  // Compress the image specifically for Groq to guarantee it fits under Groq's payload limit (avoid "Request Entity Too Large" errors)
+  // Compress image compactly for Groq payload limits & maximum speed
   let compressedForGroq = base64Image;
-  try {
-    compressedForGroq = await compressImage(base64Image, 300, 300, 0.5);
-  } catch (err) {
-    console.warn("Failed to compress image specifically for Groq:", err);
+  const alreadyCompact = /^data:image\/(jpeg|png|webp);base64,/i.test(base64Image) && base64Image.length < 95000;
+  if (!alreadyCompact) {
+    try {
+      compressedForGroq = await compressImage(base64Image, 256, 256, 0.55);
+    } catch (err) {
+      console.warn("Failed to compress image specifically for Groq:", err);
+    }
   }
 
-  // Active Groq multimodal vision models
-  const candidateModels = [
-    "meta-llama/llama-4-scout-17b-16e-instruct",
-    "qwen/qwen3.8-27b",
-    "meta-llama/llama-4-maverick-17b-128e-instruct"
-  ];
-
+  const candidateModels = await resolveGroqVisionModels(apiKey);
   let lastError: any = null;
 
   for (const modelName of candidateModels) {
     let useJsonMode = true;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    let useReasoningNone = /qwen3\.8/i.test(modelName);
+
+    for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const bodyPayload: any = {
           model: modelName,
+          temperature: 0.4,
           messages: [
             {
               role: "user",
@@ -314,15 +419,22 @@ async function callGroq(
         if (useJsonMode) {
           bodyPayload.response_format = { type: "json_object" };
         }
+        if (useReasoningNone) {
+          bodyPayload.reasoning_effort = "none";
+        }
 
-        const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${apiKey}`,
-            "Content-Type": "application/json"
+        const response = await fetchWithTimeout(
+          "https://api.groq.com/openai/v1/chat/completions",
+          {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${apiKey}`,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify(bodyPayload)
           },
-          body: JSON.stringify(bodyPayload)
-        });
+          9500
+        );
 
         const rawText = await response.text();
         let result: any = null;
@@ -357,25 +469,36 @@ async function callGroq(
         const errMsg = String(error?.message || "");
         const upper = errMsg.toUpperCase();
 
+        if (status === 400 && useReasoningNone && /reasoning_effort/i.test(errMsg)) {
+          useReasoningNone = false;
+          continue;
+        }
+
         if (status === 400 && useJsonMode && /response_format|json_object|json/i.test(errMsg)) {
           useJsonMode = false;
           continue;
         }
 
-        if ((status === 429 || status === 503 || upper.includes("RATE LIMIT") || upper.includes("OVERLOADED")) && attempt === 0) {
-          await new Promise((resolve) => setTimeout(resolve, 1200 + Math.floor(Math.random() * 400)));
-          continue;
+        if (status === 401 || status === 403 || upper.includes("INVALID_API_KEY") || upper.includes("INVALID API KEY") || upper.includes("UNAUTHORIZED")) {
+          const authErr = new Error(`Groq API Error: ${errMsg}`) as Error & { status?: number };
+          authErr.status = status || 401;
+          throw authErr;
         }
 
-        if (status === 401 || status === 403 || upper.includes("INVALID_API_KEY") || upper.includes("INVALID API KEY") || upper.includes("UNAUTHORIZED")) {
-          throw new Error(`Groq API Error: ${errMsg}`);
+        // Only try next discovered model if this model does not exist / access denied / 503; break immediately on 429 so key-switching happens fast
+        if (status === 429 || upper.includes("RATE LIMIT")) {
+          const rateErr = new Error(`Groq API Error: ${errMsg}`) as Error & { status?: number };
+          rateErr.status = 429;
+          throw rateErr;
         }
         break;
       }
     }
   }
 
-  throw new Error(`Groq API Error: ${lastError?.message || "Failed to generate metadata via Groq"}`);
+  const finalErr = new Error(`Groq API Error: ${lastError?.message || "Failed to generate metadata via Groq"}`) as Error & { status?: number };
+  if (lastError?.status) finalErr.status = lastError.status;
+  throw finalErr;
 }
 
 function cleanAndRepairJson(str: string): string {

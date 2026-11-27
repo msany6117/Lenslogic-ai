@@ -5,7 +5,7 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-export function compressImage(base64Str: string, maxWidth = 300, maxHeight = 300, quality = 0.7): Promise<string> {
+export function compressImage(base64Str: string, maxWidth = 256, maxHeight = 256, quality = 0.55): Promise<string> {
   return new Promise((resolve) => {
     if (!base64Str || base64Str.startsWith('blob:')) {
       resolve('');
@@ -13,6 +13,15 @@ export function compressImage(base64Str: string, maxWidth = 300, maxHeight = 300
     }
     const match = base64Str.match(/^data:(image\/[a-z0-9-+.]+);base64,/i);
     const mimeType = match ? match[1].toLowerCase() : 'image/jpeg';
+
+    let settled = false;
+    const done = (val: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(val);
+    };
+    const timer = setTimeout(() => done(mimeType === 'image/svg+xml' ? '' : base64Str), 4000);
 
     const img = new Image();
     img.onload = () => {
@@ -49,22 +58,22 @@ export function compressImage(base64Str: string, maxWidth = 300, maxHeight = 300
           if (mimeType === 'image/png' || mimeType === 'image/webp') {
             const webpData = canvas.toDataURL('image/webp', quality);
             if (webpData.startsWith('data:image/webp')) {
-              resolve(webpData);
+              done(webpData);
             } else {
-              resolve(canvas.toDataURL('image/jpeg', quality));
+              done(canvas.toDataURL('image/jpeg', quality));
             }
           } else {
-            resolve(canvas.toDataURL('image/jpeg', quality));
+            done(canvas.toDataURL('image/jpeg', quality));
           }
           return;
         } catch {
           // fall through to safe fallback
         }
       }
-      resolve(mimeType === 'image/svg+xml' ? '' : base64Str);
+      done(mimeType === 'image/svg+xml' ? '' : base64Str);
     };
     img.onerror = () => {
-      resolve(mimeType === 'image/svg+xml' ? '' : base64Str);
+      done(mimeType === 'image/svg+xml' ? '' : base64Str);
     };
     img.src = base64Str;
   });
@@ -96,6 +105,25 @@ export function compressToDataUrl(
       url = URL.createObjectURL(input);
       shouldRevoke = true;
     }
+
+    let settled = false;
+    const done = (val: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (shouldRevoke) {
+        try { URL.revokeObjectURL(url); } catch {}
+      }
+      resolve(val);
+    };
+
+    const timer = setTimeout(() => {
+      if (typeof input === 'string' && /^data:image\/(jpeg|png|webp);/i.test(input)) {
+        done(input);
+      } else {
+        done('');
+      }
+    }, 4000);
 
     const img = new Image();
     if (typeof input === 'string' && /^https?:\/\//i.test(input)) {
@@ -131,9 +159,8 @@ export function compressToDataUrl(
           ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
           const compressed = canvas.toDataURL('image/jpeg', quality);
-          if (shouldRevoke) URL.revokeObjectURL(url);
           if (compressed && compressed.startsWith('data:image/jpeg') && compressed.length > 25) {
-            resolve(compressed);
+            done(compressed);
             return;
           }
         } catch {
@@ -141,32 +168,28 @@ export function compressToDataUrl(
         }
       }
 
-      if (shouldRevoke) URL.revokeObjectURL(url);
       if (typeof input === 'string' && /^data:image\/(jpeg|png|webp);/i.test(input)) {
-        resolve(input);
+        done(input);
       } else {
-        resolve('');
+        done('');
       }
     };
 
     img.onerror = () => {
-      if (shouldRevoke) {
-        URL.revokeObjectURL(url);
-      }
       if (typeof input !== 'string') {
         const type = (input.type || '').toLowerCase();
         if (type === 'image/jpeg' || type === 'image/png' || type === 'image/webp') {
           const reader = new FileReader();
-          reader.onload = () => resolve((reader.result as string) || '');
-          reader.onerror = () => resolve('');
+          reader.onload = () => done((reader.result as string) || '');
+          reader.onerror = () => done('');
           reader.readAsDataURL(input);
         } else {
-          resolve('');
+          done('');
         }
       } else if (/^data:image\/(jpeg|png|webp);/i.test(input)) {
-        resolve(input);
+        done(input);
       } else {
-        resolve('');
+        done('');
       }
     };
 

@@ -26,7 +26,7 @@ import {
 import { useDropzone } from 'react-dropzone';
 import Papa from 'papaparse';
 import { cn, compressToDataUrl } from './lib/utils';
-import { generateMetadata as generateMetadataService } from './services/aiService';
+import { generateMetadata as generateMetadataService, getHealthyApiKeys } from './services/aiService';
 import { loadVectorPreview } from './services/vectorService';
 import type { GenerationSettings, ImageMetadata, AssetType } from './types';
 
@@ -47,6 +47,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<'metadata' | 'studio' | 'techbg' | 'settings' | 'admin'>('metadata');
   const [isProcessingAll, setIsProcessingAll] = useState(false);
   const [batchProgress, setBatchProgress] = useState<{ total: number; completed: number; currentName: string; isRateLimited: boolean } | null>(null);
+  const [autoSwitchNotice, setAutoSwitchNotice] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [filterType, setFilterType] = useState<string>('all');
   const [visibleKeyIds, setVisibleKeyIds] = useState<Record<string, boolean>>({});
@@ -465,10 +466,10 @@ export default function App() {
 
       let base64 = '';
       if (image.preview) {
-        base64 = await compressToDataUrl(image.preview, 384, 384, 0.68);
+        base64 = await compressToDataUrl(image.preview, 256, 256, 0.55);
       }
       if ((!base64 || !/^data:image\/(jpeg|png|webp);base64,/i.test(base64)) && image.file) {
-        base64 = await compressToDataUrl(image.file, 384, 384, 0.68);
+        base64 = await compressToDataUrl(image.file, 256, 256, 0.55);
       }
 
       if (!base64 || !/^data:image\/(jpeg|png|webp);base64,/i.test(base64)) {
@@ -477,32 +478,53 @@ export default function App() {
 
       const fileExt = (image.fileName || image.file?.name || '').split('.').pop()?.toLowerCase() || '';
 
+      const handleAutoSwitch = (switchedKey: GenerationSettings['apiKeys'][number], shouldPersist: boolean) => {
+        if (!switchedKey?.id) return;
+        const label = switchedKey.label || switchedKey.provider;
+        if (shouldPersist && settingsRef.current.activeKeyId !== switchedKey.id) {
+          settingsRef.current = { ...settingsRef.current, activeKeyId: switchedKey.id };
+          setSettings(s => s.activeKeyId === switchedKey.id ? s : ({ ...s, activeKeyId: switchedKey.id }));
+          setAutoSwitchNotice(`API key auto-switched to "${label}" (${switchedKey.provider})`);
+        } else if (!shouldPersist) {
+          setAutoSwitchNotice(`Temporarily routed through backup key "${label}" (${switchedKey.provider}) while primary server is busy`);
+        }
+        setTimeout(() => {
+          setAutoSwitchNotice(prev => (prev && prev.includes(label) ? null : prev));
+        }, 5000);
+      };
+
       let data;
-      const backoffDelaysMs = [1500, 3000, 5000];
+      const backoffDelaysMs = [1200, 2600, 4500];
       for (let attempt = 0; attempt <= backoffDelaysMs.length; attempt++) {
         try {
-          data = await generateMetadataService(base64, currentSettings, activeKey, image.type, fileExt);
+          data = await generateMetadataService(base64, settingsRef.current, activeKey, image.type, fileExt, handleAutoSwitch);
           break;
         } catch (err: any) {
           const msg = String(err?.message || '').toLowerCase();
+          const isAuthPermanent =
+            msg.includes('api key required') ||
+            msg.includes('invalid') ||
+            msg.includes('unauthorized') ||
+            msg.includes('no vision-capable model');
           const isTransient =
-            msg.includes('429') ||
-            msg.includes('quota') ||
-            msg.includes('rate') ||
-            msg.includes('503') ||
-            msg.includes('high demand') ||
-            msg.includes('busy') ||
-            msg.includes('unavailable') ||
-            msg.includes('timed out') ||
-            msg.includes('html') ||
-            msg.includes('non-json') ||
-            msg.includes('failed to fetch') ||
-            msg.includes('reach the metadata server');
+            !isAuthPermanent &&
+            (msg.includes('429') ||
+              msg.includes('quota') ||
+              msg.includes('rate') ||
+              msg.includes('503') ||
+              msg.includes('high demand') ||
+              msg.includes('busy') ||
+              msg.includes('unavailable') ||
+              msg.includes('timed out') ||
+              msg.includes('html') ||
+              msg.includes('non-json') ||
+              msg.includes('failed to fetch') ||
+              msg.includes('reach the metadata server'));
           if (isTransient && attempt < backoffDelaysMs.length) {
             const retrySecMatch = msg.match(/retry\s+in\s+(\d+)\s*s/i);
-            const hintedMs = retrySecMatch ? Math.min(6500, Number(retrySecMatch[1]) * 1000) : 0;
+            const hintedMs = retrySecMatch ? Math.min(4500, Number(retrySecMatch[1]) * 1000) : 0;
             const waitMs = Math.max(backoffDelaysMs[attempt], hintedMs);
-            const jitter = Math.floor(Math.random() * 500);
+            const jitter = Math.floor(Math.random() * 300);
             await new Promise(r => setTimeout(r, waitMs + jitter));
             continue;
           }
@@ -518,7 +540,7 @@ export default function App() {
       return {};
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : 'Generation failed';
-      const isRateLimited = /429|quota|rate|503|high demand|busy|unavailable/i.test(errorMsg);
+      const isRateLimited = /429|quota|rate|503|high demand|busy|unavailable|timed out/i.test(errorMsg);
       if (!isRateLimited) {
         console.error('Generation Error:', error);
       }
@@ -546,9 +568,12 @@ export default function App() {
     }
 
     const validKeys = (settingsRef.current.apiKeys || []).filter(k => Boolean(k?.key?.trim()));
+    const healthyStartKeys = getHealthyApiKeys(validKeys);
+    const keyCapacity = Math.max(1, healthyStartKeys.length);
     const isSafe = settingsRef.current.batchSpeed !== 'turbo';
-    const CONCURRENCY = isSafe ? Math.max(2, Math.min(4, validKeys.length * 2 || 2)) : Math.max(4, Math.min(8, validKeys.length * 3 || 4));
-    const DELAY_MS = isSafe ? 350 : 100;
+    // Balance concurrency per healthy key so single keys don't instantly trip burst 503/RPM limits while multi-key setups scale fast
+    const CONCURRENCY = isSafe ? Math.max(2, Math.min(4, keyCapacity * 2)) : Math.max(3, Math.min(8, keyCapacity * 3));
+    const DELAY_MS = isSafe ? (keyCapacity > 1 ? 60 : 200) : 0;
 
     let completedCount = 0;
     let keyCursor = 0;
@@ -570,24 +595,26 @@ export default function App() {
         const assetName = img.fileName || img.file?.name || 'Asset';
         setBatchProgress(p => p ? { ...p, currentName: assetName } : null);
 
-        // Rotate across all configured user keys automatically for higher throughput
-        const preferredKey = validKeys.length > 0 ? validKeys[keyCursor++ % validKeys.length] : null;
+        // Always rotate strictly across currently healthy keys so exhausted keys are skipped automatically
+        const latestValidKeys = (settingsRef.current.apiKeys || []).filter(k => Boolean(k?.key?.trim()));
+        const healthyNow = getHealthyApiKeys(latestValidKeys);
+        const preferredKey = healthyNow.length > 0 ? healthyNow[keyCursor++ % healthyNow.length] : null;
         const outcome = await generateMetadata(img, preferredKey);
 
         const prevRequeues = requeueCounts.get(img.id) || 0;
-        if (outcome.rateLimited && prevRequeues < 2) {
+        if (outcome.rateLimited && prevRequeues < 3) {
           requeueCounts.set(img.id, prevRequeues + 1);
           setImages(prev => prev.map(item => item.id === img.id ? { ...item, status: 'idle', error: undefined } : item));
           queue.push(img);
           setBatchProgress(p => p ? { ...p, isRateLimited: true } : null);
-          await new Promise(r => setTimeout(r, 3500 + prevRequeues * 1500));
+          await new Promise(r => setTimeout(r, 1800));
           setBatchProgress(p => p ? { ...p, isRateLimited: false } : null);
           continue;
         }
 
         if (outcome.rateLimited) {
           setBatchProgress(p => p ? { ...p, isRateLimited: true } : null);
-          await new Promise(r => setTimeout(r, 3000));
+          await new Promise(r => setTimeout(r, 1000));
           setBatchProgress(p => p ? { ...p, isRateLimited: false } : null);
         }
 
@@ -1033,6 +1060,21 @@ export default function App() {
                         to analyze uploaded files and generate metadata.
                       </p>
                     </div>
+                  </div>
+                )}
+
+                {autoSwitchNotice && (
+                  <div className="bg-emerald-50 border border-emerald-200 px-4 py-2.5 rounded-2xl flex items-center justify-between gap-3 text-xs text-emerald-800 shadow-xs">
+                    <div className="flex items-center gap-2 font-semibold">
+                      <Key className="w-4 h-4 text-emerald-600 shrink-0" />
+                      <span>{autoSwitchNotice}</span>
+                    </div>
+                    <button
+                      onClick={() => setAutoSwitchNotice(null)}
+                      className="text-emerald-600 hover:text-emerald-800 font-bold cursor-pointer"
+                    >
+                      ×
+                    </button>
                   </div>
                 )}
 

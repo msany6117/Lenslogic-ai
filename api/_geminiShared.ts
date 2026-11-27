@@ -1,4 +1,4 @@
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, ThinkingLevel, Type } from "@google/genai";
 
 export function getAiClient(customKey?: string) {
   const trimmed = typeof customKey === "string" ? customKey.trim() : "";
@@ -32,6 +32,80 @@ export function safeParseJsonObject(rawText: string): any {
   }
 }
 
+export function parseMetadataJsonWithFallback(rawText: string): any {
+  try {
+    return safeParseJsonObject(rawText);
+  } catch {
+    const titleMatch = rawText.match(/"title"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+    const descMatch = rawText.match(/"description"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+    const keywordsMatch = rawText.match(/"keywords"\s*:\s*\[([\s\S]*?)(?:\]|$)/);
+    if (!titleMatch && !keywordsMatch) {
+      throw new Error("AI response did not contain valid JSON metadata.");
+    }
+    const title = titleMatch
+      ? titleMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\")
+      : "Stock Asset";
+    const description = descMatch
+      ? descMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\")
+      : "";
+    let keywords: string[] = [];
+    if (keywordsMatch) {
+      const kwMatches = keywordsMatch[1].match(/"((?:[^"\\]|\\.)*)"/g);
+      if (kwMatches) {
+        keywords = kwMatches.map((m) =>
+          m.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, "\\")
+        );
+      }
+    }
+    return { title, description, keywords };
+  }
+}
+
+export function isQuotaOrRateError(err: any): boolean {
+  const status = Number(err?.status || err?.upstreamStatus || 0);
+  const upper = String(err?.message || err || "").toUpperCase();
+  return (
+    status === 429 ||
+    upper.includes("429") ||
+    upper.includes("RESOURCE_EXHAUSTED") ||
+    upper.includes("QUOTA") ||
+    upper.includes("RATE LIMIT")
+  );
+}
+
+export function isAuthOrAccessError(err: any): boolean {
+  const status = Number(err?.status || err?.upstreamStatus || 0);
+  const upper = String(err?.message || err || "").toUpperCase();
+  return (
+    status === 401 ||
+    status === 403 ||
+    upper.includes("API_KEY_INVALID") ||
+    upper.includes("API KEY NOT VALID") ||
+    upper.includes("INVALID_API_KEY") ||
+    upper.includes("INVALID API KEY") ||
+    upper.includes("PERMISSION_DENIED") ||
+    upper.includes("UNAUTHORIZED") ||
+    upper.includes("NO VISION-CAPABLE MODEL")
+  );
+}
+
+export function isTransientBusyError(err: any): boolean {
+  if (isQuotaOrRateError(err) || isAuthOrAccessError(err)) return false;
+  const status = Number(err?.status || err?.upstreamStatus || 0);
+  const upper = String(err?.message || err || "").toUpperCase();
+  return (
+    status === 503 ||
+    status === 504 ||
+    upper.includes("503") ||
+    upper.includes("UNAVAILABLE") ||
+    upper.includes("HIGH DEMAND") ||
+    upper.includes("TEMPORARILY BUSY") ||
+    upper.includes("ABORT") ||
+    upper.includes("TIMEOUT") ||
+    upper.includes("TIMED OUT")
+  );
+}
+
 export function extractCleanUpstreamError(err: any, fallbackMsg: string): string {
   let raw = String(err?.message || fallbackMsg || "").trim();
   if (raw.startsWith("{") || raw.includes('"error"')) {
@@ -50,7 +124,7 @@ export function extractCleanUpstreamError(err: any, fallbackMsg: string): string
   if (raw.includes("API_KEY_INVALID") || raw.includes("API key not valid")) {
     return "Gemini API key is invalid or unauthorized. Please check your key in AI Configuration.";
   }
-  if (raw.includes("429") || raw.includes("RESOURCE_EXHAUSTED") || raw.includes("quota")) {
+  if (raw.includes("429") || raw.includes("RESOURCE_EXHAUSTED") || raw.toLowerCase().includes("quota")) {
     const retryMatch = raw.match(/retry\s+in\s+([\d.]+)s/i);
     const retryHint = retryMatch ? ` (retry in ${Math.ceil(Number(retryMatch[1]))}s)` : "";
     return `Google Gemini API rate limit reached on your API key${retryHint}. Please wait a moment or add an additional key in AI Configuration.`;
@@ -65,7 +139,8 @@ export function extractCleanUpstreamError(err: any, fallbackMsg: string): string
   if (
     raw.includes("TimeoutError") ||
     raw.includes("aborted due to timeout") ||
-    raw.includes("operation was aborted")
+    raw.includes("operation was aborted") ||
+    raw.includes("AbortError")
   ) {
     return "AI request timed out under server load. Please retry in a moment.";
   }
@@ -113,42 +188,18 @@ export function buildSeoPrompt(settings: any, assetType = "Photo", fileExtension
   const isTransparent = Boolean(settings?.transparentBackground);
   const { extUpper, phrase } = getFormatLabel(fileExtension, assetType, isTransparent);
 
-  return `
-      You are an elite Stock Marketplace SEO Strategist who ranks assets #1 on ${platform}, Shutterstock, and Freepik for maximum contributor downloads.
-      Analyze the image carefully and generate ultra-high-converting, buyer-intent metadata.
-
-      Asset Context:
-      - Target Marketplace: ${platform}
-      - Asset Type: ${assetType}
-      - File Format: ${extUpper} (${phrase})
-      - Title Length Target: ${titleLength} characters (strictly respect this length window).
-      - Keyword Count: Exactly ${keywordCount} keywords.
-      - Transparent Background Mode: ${isTransparent ? "ENABLED (MANDATORY)" : "AUTO-DETECT"}
-
-      Title SEO Rules (CRITICAL for top search ranking & downloads):
-      1. Front-load the most-searched primary subject, action, and commercial concept in the FIRST 50 characters.
-      2. ALWAYS naturally include the asset/file format (${extUpper} / ${phrase}) inside the title so buyers filtering or searching for "${extUpper}" or "${assetType.toLowerCase()}" find this asset immediately.
-      3. Include visual style, mood, composition, or commercial use-case (e.g., flat minimalist, 3D render, vibrant gradient, marketing banner, UI icon) without robotic repetition.
-      ${
-        isTransparent
-          ? `4. TRANSPARENT RULE (STRICT): This file has a transparent background. You MUST explicitly include "transparent" or "isolated on transparent background" in the title. NEVER write "white background", "on white", "isolated on white", or "white backdrop" anywhere in the title, description, or keywords.`
-          : `4. Background Rule: Only describe a white background if it is visibly solid white; if isolated or transparent, state "isolated on transparent background" or "isolated graphic".`
-      }
-      ${settings?.prefix ? `5. Title Prefix context: Start naturally with or accommodate prefix "${settings.prefix}".` : ""}
-      ${settings?.suffix ? `6. Title Suffix context: End naturally with or accommodate suffix "${settings.suffix}".` : ""}
-
-      Keyword SEO Rules (Ordered strictly by search weight — strongest 10 keywords FIRST):
-      1. Top 10 keywords MUST be the highest-volume exact-match subject, style, and main commercial concept terms.
-      2. Remaining keywords MUST blend high-converting buyer-intent phrases, commercial use-cases (branding, web design, poster, banner, marketing, presentation, template), color/mood/lighting descriptors, and format/asset tags (${extUpper.toLowerCase()}, ${assetType.toLowerCase()}).
-      ${
-        isTransparent
-          ? `3. TRANSPARENT & PNG KEYWORDS REQUIRED: Include high-traffic transparent keywords ("transparent", "transparent background", "png", "isolated", "cutout", "no background", "alpha channel") among the keywords. Exclude any "white background" keywords.`
-          : ""
-      }
-      4. Exclude weak filler words ("nice", "good", "file", "picture"), duplicates, and prohibited terms: ${settings?.negativeKeywords || "None"}.
-
-      Output strictly valid JSON with keys: "title", "description", "keywords" (array of ${keywordCount} unique SEO keywords).
-    `;
+  return `Stock SEO strategist for ${platform}. Analyze image & return JSON: {"title","description","keywords"}.
+Context: Type=${assetType}, Format=${extUpper} (${phrase}), TitleLen=${titleLength} chars, Keywords=${keywordCount} exact, Transparent=${isTransparent ? "MANDATORY" : "AUTO"}.
+Title rules: Front-load top commercial subject in first 50 chars; include ${extUpper}/${phrase}; ${
+    isTransparent
+      ? 'MUST include "transparent" or "isolated on transparent background", NEVER mention "white background".'
+      : 'Note "transparent background" if transparent, or "white background" only if solid white.'
+  }${settings?.prefix ? ` Start with "${settings.prefix}".` : ""}${settings?.suffix ? ` End with "${settings.suffix}".` : ""}
+Keyword rules: Top 10 highest-volume subject/style terms first, then buyer use-cases, mood, format (${extUpper.toLowerCase()}, ${assetType.toLowerCase()}).${
+    isTransparent
+      ? ' Include "transparent","transparent background","png","isolated","cutout","no background"; exclude white background.'
+      : ""
+  } No duplicates, weak fillers, or: ${settings?.negativeKeywords || "None"}.`;
 }
 
 export function sanitizeTransparentAndFormat(
@@ -251,6 +302,373 @@ export function sanitizeTransparentAndFormat(
   return { title, description, keywords };
 }
 
+export function parseImageDataPayload(base64Image: string): { mimeType: string; data: string } {
+  let mimeType = "image/jpeg";
+  let data = "";
+  if (base64Image.startsWith("data:")) {
+    const commaIdx = base64Image.indexOf(",");
+    const header = commaIdx >= 0 ? base64Image.slice(0, commaIdx) : base64Image;
+    data = commaIdx >= 0 ? base64Image.slice(commaIdx + 1).trim() : "";
+    const detected = header.match(/data:([^;]+);/i)?.[1]?.toLowerCase() || "image/jpeg";
+    if (detected === "image/svg+xml") {
+      throw Object.assign(new Error("SVG image must be rasterized to PNG/JPEG before AI analysis."), {
+        status: 400,
+      });
+    }
+    const allowedMimes = new Set([
+      "image/jpeg",
+      "image/png",
+      "image/webp",
+      "image/heic",
+      "image/heif",
+    ]);
+    mimeType = allowedMimes.has(detected) ? detected : "image/jpeg";
+  } else {
+    data = base64Image.trim();
+  }
+
+  if (!data || data.length < 16) {
+    throw Object.assign(
+      new Error("Image payload is empty or corrupted. Please try re-uploading the asset."),
+      { status: 400 }
+    );
+  }
+  return { mimeType, data };
+}
+
+export async function generateGeminiMetadataWithRecovery(params: {
+  apiKey: string;
+  data: string;
+  mimeType: string;
+  prompt: string;
+  keywordCount: number;
+  settings: any;
+  assetType?: string;
+  fileExtension?: string;
+  isServerless?: boolean;
+}) {
+  const {
+    apiKey,
+    data,
+    mimeType,
+    prompt,
+    keywordCount,
+    settings,
+    assetType = "Photo",
+    fileExtension,
+    isServerless = false,
+  } = params;
+
+  const ai = getAiClient(apiKey);
+  const totalBudgetMs = isServerless ? 8900 : 17500;
+  const requestDeadline = Date.now() + totalBudgetMs;
+
+  const runGeminiCall = (model: string, thinkingLevel: ThinkingLevel, timeoutMs: number) =>
+    ai.models.generateContent({
+      model,
+      contents: {
+        parts: [
+          { text: prompt },
+          {
+            inlineData: {
+              data,
+              mimeType,
+            },
+          },
+        ],
+      },
+      config: {
+        thinkingConfig: { thinkingLevel },
+        abortSignal: AbortSignal.timeout(Math.max(1500, timeoutMs)),
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            title: {
+              type: Type.STRING,
+              description: "High-ranking SEO stock title optimized for downloads.",
+            },
+            description: {
+              type: Type.STRING,
+              description: "A clear semantic description for stock search indexing.",
+            },
+            keywords: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING },
+              description: `A flat array of exactly ${keywordCount} keywords ordered by search relevance.`,
+            },
+          },
+          required: ["title", "description", "keywords"],
+        },
+      },
+    });
+
+  // Primary lightweight model (MINIMAL thinking, zero token waste).
+  // Switch to Hydrogen / retry briefly ONLY on 503/timeout — NEVER retry 429/401/403 on the same key.
+  const stages: Array<{ model: string; thinking: ThinkingLevel; maxTimeoutMs: number; delayBeforeMs: number }> =
+    isServerless
+      ? [
+          { model: "gemini-3.1-flash-lite", thinking: ThinkingLevel.MINIMAL, maxTimeoutMs: 4400, delayBeforeMs: 0 },
+          { model: "gemini-4-hydrogen", thinking: ThinkingLevel.LOW, maxTimeoutMs: 4200, delayBeforeMs: 0 },
+          { model: "gemini-3.1-flash-lite", thinking: ThinkingLevel.MINIMAL, maxTimeoutMs: 4000, delayBeforeMs: 700 },
+        ]
+      : [
+          { model: "gemini-3.1-flash-lite", thinking: ThinkingLevel.MINIMAL, maxTimeoutMs: 5500, delayBeforeMs: 0 },
+          { model: "gemini-4-hydrogen", thinking: ThinkingLevel.LOW, maxTimeoutMs: 6500, delayBeforeMs: 0 },
+          { model: "gemini-3.1-flash-lite", thinking: ThinkingLevel.MINIMAL, maxTimeoutMs: 5500, delayBeforeMs: 850 },
+          { model: "gemini-4-hydrogen", thinking: ThinkingLevel.LOW, maxTimeoutMs: 6000, delayBeforeMs: 1150 },
+        ];
+
+  let lastErr: any = null;
+
+  for (let idx = 0; idx < stages.length; idx++) {
+    const stage = stages[idx];
+    if (stage.delayBeforeMs > 0) {
+      const jitter = Math.floor(Math.random() * 200);
+      const waitMs = stage.delayBeforeMs + jitter;
+      if (requestDeadline - Date.now() <= waitMs + 1800) {
+        break;
+      }
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+
+    const remaining = requestDeadline - Date.now();
+    if (remaining < 1700) {
+      break;
+    }
+
+    try {
+      const response = await runGeminiCall(
+        stage.model,
+        stage.thinking,
+        Math.min(stage.maxTimeoutMs, remaining - 150)
+      );
+      if (!response || !response.text) {
+        throw new Error("No response returned from Gemini API");
+      }
+      const parsed = parseMetadataJsonWithFallback(response.text);
+      return sanitizeTransparentAndFormat(parsed, settings || {}, assetType, fileExtension);
+    } catch (err: any) {
+      lastErr = err;
+      if (!isTransientBusyError(err)) {
+        // Immediate exit on 429 quota, 401/403 invalid key, or bad payload
+        throw err;
+      }
+    }
+  }
+
+  throw lastErr || new Error("Gemini AI servers are temporarily busy (503). Please try again in a moment.");
+}
+
+const serverGroqModelsCache = new Map<string, { models: string[]; expiresAt: number }>();
+
+async function discoverGroqVisionModels(apiKey: string): Promise<string[]> {
+  const cached = serverGroqModelsCache.get(apiKey);
+  if (cached && Date.now() < cached.expiresAt && cached.models.length > 0) {
+    return cached.models;
+  }
+
+  const preferredOrder = [
+    "qwen/qwen3.8-27b",
+    "meta-models/muse-spark-open",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+  ];
+  const fallbackDefaults = ["qwen/qwen3.8-27b", "meta-models/muse-spark-open"];
+
+  let res: Response | null = null;
+  try {
+    res = await fetch("https://api.groq.com/openai/v1/models", {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+      },
+      signal: AbortSignal.timeout(3500),
+    });
+  } catch {
+    return fallbackDefaults;
+  }
+
+  if (res.status === 401 || res.status === 403) {
+    throw Object.assign(
+      new Error("Groq API key is invalid or unauthorized. Please check your key in AI Configuration."),
+      { status: res.status }
+    );
+  }
+
+  if (!res.ok) {
+    return fallbackDefaults;
+  }
+
+  const payload = await res.json().catch(() => null);
+  const allIds: string[] = Array.isArray(payload?.data)
+    ? payload.data.map((m: any) => String(m?.id || "")).filter(Boolean)
+    : [];
+
+  if (allIds.length === 0) {
+    return fallbackDefaults;
+  }
+
+  const excluded = /whisper|playai|tts|guard|safeguard|embed|orpheus|allam|compound/i;
+  const visionCandidates = allIds.filter(
+    (id) =>
+      !excluded.test(id) &&
+      /(qwen3\.8|muse-spark|vision|\bvl\b|pixtral|llava|gemma-3|llama-4|multimodal|omni)/i.test(id)
+  );
+
+  if (visionCandidates.length === 0) {
+    throw Object.assign(
+      new Error(
+        "Groq key has no vision-capable model (such as qwen/qwen3.8-27b) enabled in Groq Console -> Model Permissions. Enable a vision model in Groq Console or use a Gemini API key."
+      ),
+      { status: 403 }
+    );
+  }
+
+  const ordered = [
+    ...preferredOrder.filter((id) => visionCandidates.includes(id)),
+    ...visionCandidates.filter((id) => !preferredOrder.includes(id)),
+  ];
+
+  serverGroqModelsCache.set(apiKey, {
+    models: ordered,
+    expiresAt: Date.now() + 5 * 60 * 1000,
+  });
+
+  return ordered;
+}
+
+export async function generateGroqMetadataServer(params: {
+  base64Image: string;
+  apiKey: string;
+  prompt: string;
+  settings: any;
+  assetType?: string;
+  fileExtension?: string;
+  isServerless?: boolean;
+}) {
+  const {
+    base64Image,
+    apiKey,
+    prompt,
+    settings,
+    assetType = "Photo",
+    fileExtension,
+    isServerless = false,
+  } = params;
+
+  const candidateModels = await discoverGroqVisionModels(apiKey);
+  const deadline = Date.now() + (isServerless ? 8800 : 16000);
+  let lastError: any = null;
+
+  for (const modelName of candidateModels) {
+    let useJsonMode = true;
+    let useReasoningNone = /qwen3\.8/i.test(modelName);
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const remaining = deadline - Date.now();
+      if (remaining < 1600) {
+        throw lastError || Object.assign(new Error("Groq request timed out under load."), { status: 504 });
+      }
+
+      try {
+        const bodyPayload: any = {
+          model: modelName,
+          temperature: 0.4,
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: prompt },
+                {
+                  type: "image_url",
+                  image_url: {
+                    url: base64Image,
+                  },
+                },
+              ],
+            },
+          ],
+        };
+        if (useJsonMode) {
+          bodyPayload.response_format = { type: "json_object" };
+        }
+        if (useReasoningNone) {
+          bodyPayload.reasoning_effort = "none";
+        }
+
+        const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(bodyPayload),
+          signal: AbortSignal.timeout(Math.min(8200, remaining - 150)),
+        });
+
+        const rawText = await response.text();
+        let result: any = null;
+        if (rawText) {
+          try {
+            result = JSON.parse(rawText);
+          } catch {
+            result = null;
+          }
+        }
+
+        if (!response.ok) {
+          const msg = result?.error?.message || response.statusText || `HTTP ${response.status}`;
+          throw Object.assign(new Error(msg), { status: response.status });
+        }
+
+        const content = result?.choices?.[0]?.message?.content;
+        if (!content) {
+          throw new Error("No response content returned from Groq");
+        }
+
+        const parsed = parseMetadataJsonWithFallback(content);
+        return sanitizeTransparentAndFormat(parsed, settings || {}, assetType, fileExtension);
+      } catch (err: any) {
+        lastError = err;
+        const status = Number(err?.status || 0);
+        const msg = String(err?.message || "");
+        const upper = msg.toUpperCase();
+
+        if (status === 400 && useReasoningNone && /reasoning_effort/i.test(msg)) {
+          useReasoningNone = false;
+          continue;
+        }
+        if (status === 400 && useJsonMode && /response_format|json_object|json/i.test(msg)) {
+          useJsonMode = false;
+          continue;
+        }
+        if (status === 401 || status === 403 || upper.includes("INVALID_API_KEY") || upper.includes("UNAUTHORIZED")) {
+          throw Object.assign(new Error(`Groq API Error: ${msg}`), { status: status || 401 });
+        }
+        if (status === 429 || upper.includes("RATE LIMIT")) {
+          throw Object.assign(new Error(`Groq API Error: ${msg}`), { status: 429 });
+        }
+        // On 404 (model access disabled) or 503, move to next candidate model
+        break;
+      }
+    }
+  }
+
+  const finalMsg = String(lastError?.message || "Failed to generate metadata via Groq");
+  if (/does not exist|do not have access/i.test(finalMsg)) {
+    throw Object.assign(
+      new Error(
+        `Groq API Error: No vision model could be accessed on this Groq key (${finalMsg}). Check Groq Console -> Model Permissions or use a Gemini API key.`
+      ),
+      { status: 403 }
+    );
+  }
+  throw Object.assign(new Error(`Groq API Error: ${finalMsg}`), {
+    status: Number(lastError?.status || 500),
+  });
+}
+
 export function applyCors(req: any, res: any): boolean {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -261,3 +679,4 @@ export function applyCors(req: any, res: any): boolean {
   }
   return false;
 }
+
