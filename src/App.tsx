@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useRef, useEffect, type ReactNode } from 'react';
-import { motion, AnimatePresence } from 'motion/react';
+import { motion } from 'motion/react';
 import { 
   Upload, 
   Settings, 
@@ -28,6 +28,7 @@ import Papa from 'papaparse';
 import { cn, compressToDataUrl } from './lib/utils';
 import { generateMetadata as generateMetadataService, getHealthyApiKeys } from './services/aiService';
 import { loadVectorPreview } from './services/vectorService';
+import { loadPsdPreview } from './services/freepikService';
 import type { GenerationSettings, ImageMetadata, AssetType } from './types';
 
 import { saveUserProfile, getApiUrl, ensureGuestSession, getAuthToken, verifyAuthSession, setAuthToken } from './services/dbService';
@@ -45,6 +46,9 @@ export default function App() {
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [activeTab, setActiveTab] = useState<'metadata' | 'studio' | 'techbg' | 'settings' | 'admin'>('metadata');
+  const [studioMounted, setStudioMounted] = useState(false);
+  const [techBgMounted, setTechBgMounted] = useState(false);
+  const [studioSessionKey, setStudioSessionKey] = useState(0);
   const [isProcessingAll, setIsProcessingAll] = useState(false);
   const [batchProgress, setBatchProgress] = useState<{ total: number; completed: number; currentName: string; isRateLimited: boolean } | null>(null);
   const [autoSwitchNotice, setAutoSwitchNotice] = useState<string | null>(null);
@@ -192,11 +196,19 @@ export default function App() {
     setShowResetConfirm(true);
   };
 
+  useEffect(() => {
+    if (activeTab === 'studio') setStudioMounted(true);
+    if (activeTab === 'techbg') setTechBgMounted(true);
+  }, [activeTab]);
+
   const confirmResetSession = () => {
     localStorage.removeItem('lenslogic_user');
     setAuthToken(null);
     setImages([]);
     setActiveTab('metadata');
+    setStudioMounted(false);
+    setTechBgMounted(false);
+    setStudioSessionKey(k => k + 1);
     const guestUid = 'guest_' + Math.random().toString(36).substring(2, 11);
     const guestUser = {
       uid: guestUid,
@@ -267,7 +279,9 @@ export default function App() {
         const vectorExts = ['svg', 'eps', 'ai', 'pdf'];
         const videoExts = ['mp4', 'mov', 'avi', 'mkv', 'webm', 'mpg'];
 
-        if (vectorExts.includes(extension || '')) {
+        if (extension === 'psd') {
+          type = 'PSD';
+        } else if (vectorExts.includes(extension || '')) {
           type = 'Vector';
         } else if (videoExts.includes(extension || '')) {
           type = 'Video';
@@ -279,7 +293,7 @@ export default function App() {
         let preview = '';
         const normBase = normalize(fileName);
         const foundPreview =
-          (type === 'Video' || (type === 'Vector' && extension !== 'svg'))
+          (type === 'Video' || type === 'PSD' || (type === 'Vector' && extension !== 'svg'))
             ? (getRefUrl(normBase) || existingRefs.get(normBase))
             : undefined;
 
@@ -371,6 +385,15 @@ export default function App() {
           } catch (e) {
             console.warn(`Auto preview extraction failed for ${fileName}:`, e);
           }
+        } else if (extension === 'psd') {
+          try {
+            const psdPreview = await loadPsdPreview(file, { maxDimension: 1024 });
+            if (psdPreview?.previewUrl) {
+              preview = psdPreview.previewUrl;
+            }
+          } catch (e) {
+            console.warn(`Auto PSD preview extraction failed for ${fileName}:`, e);
+          }
         } else {
           // Reuse cached blob URL if already created as a reference for a sibling vector/video
           preview = referencePreviewCache.get(normBase) || URL.createObjectURL(file);
@@ -403,7 +426,7 @@ export default function App() {
       setImages(prev => {
         const updatedPrev = prev.map(img => {
           const imgName = img.file?.name || img.fileName || '';
-          if (!img.preview && (img.type === 'Video' || (img.type === 'Vector' && !imgName.toLowerCase().endsWith('.svg')))) {
+          if (!img.preview && (img.type === 'Video' || img.type === 'PSD' || (img.type === 'Vector' && !imgName.toLowerCase().endsWith('.svg')))) {
             const normBase = normalize(imgName);
             const newRef = getRefUrl(normBase);
             if (newRef) {
@@ -433,7 +456,12 @@ export default function App() {
       'application/x-eps': ['.eps'],
       'image/eps': ['.eps'],
       'image/x-eps': ['.eps'],
-      'application/pdf': ['.pdf']
+      'application/pdf': ['.pdf'],
+      'image/vnd.adobe.photoshop': ['.psd'],
+      'application/x-photoshop': ['.psd'],
+      'application/photoshop': ['.psd'],
+      'application/psd': ['.psd'],
+      'image/psd': ['.psd']
     } as any,
     multiple: true
   } as any);
@@ -443,7 +471,7 @@ export default function App() {
     image: ImageMetadata,
     overrideKey?: GenerationSettings['apiKeys'][number] | null
   ): Promise<{ rateLimited?: boolean }> => {
-    if (!image.preview && (image.type === 'Vector' || image.type === 'Video')) {
+    if (!image.preview && (image.type === 'Vector' || image.type === 'Video' || image.type === 'PSD')) {
       const updatedImg = { 
         ...image, 
         status: 'error' as const, 
@@ -557,7 +585,7 @@ export default function App() {
     setIsProcessingAll(true);
     const pending = imagesRef.current.filter(img => {
       const isIdleOrError = img.status === 'idle' || img.status === 'error';
-      const needsPreview = (img.type === 'Vector' || img.type === 'Video');
+      const needsPreview = (img.type === 'Vector' || img.type === 'Video' || img.type === 'PSD');
       const hasPreview = !!img.preview;
       return isIdleOrError && (!needsPreview || hasPreview);
     });
@@ -660,20 +688,47 @@ export default function App() {
     setImages(prev => prev.map(img => img.id === id ? { ...img, [field]: value } : img));
   };
 
-  const exportCSV = () => {
-    const data = imagesRef.current.map(img => ({
-      Filename: img.fileName || img.file?.name || "unnamed_asset",
-      Title: img.title,
-      Description: img.description,
-      Keywords: img.keywords.join(',')
-    }));
+  const exportCSV = (format: 'adobe' | 'freepik' = 'adobe') => {
+    const dateStamp = new Date().toISOString().slice(0, 10);
+    let csv = '';
+    let downloadName = `LensLogic_AdobeStock_${dateStamp}.csv`;
 
-    const csv = Papa.unparse(data);
+    if (format === 'freepik') {
+      const sanitizeFreepikCell = (val: string) =>
+        String(val || '')
+          .replace(/[\r\n]+/g, ' ')
+          .replace(/;/g, ',')
+          .replace(/"/g, '')
+          .replace(/\s+/g, ' ')
+          .trim();
+
+      const header = 'filename;title;tags';
+      const rows = imagesRef.current.map((img) => {
+        const filename = sanitizeFreepikCell(img.fileName || img.file?.name || 'unnamed_asset');
+        const title = sanitizeFreepikCell(img.title || '');
+        const tags = (img.keywords || [])
+          .map((kw) => sanitizeFreepikCell(kw).replace(/,/g, ''))
+          .filter(Boolean)
+          .join(',');
+        return `${filename};${title};${tags}`;
+      });
+      csv = [header, ...rows].join('\n');
+      downloadName = `LensLogic_Freepik_${dateStamp}.csv`;
+    } else {
+      const data = imagesRef.current.map(img => ({
+        Filename: img.fileName || img.file?.name || "unnamed_asset",
+        Title: img.title,
+        Description: img.description,
+        Keywords: img.keywords.join(',')
+      }));
+      csv = Papa.unparse(data);
+    }
+
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const link = document.createElement('a');
     const url = URL.createObjectURL(blob);
     link.setAttribute('href', url);
-    link.setAttribute('download', `LensLogic_Export_${new Date().toISOString().slice(0,10)}.csv`);
+    link.setAttribute('download', downloadName);
     link.style.visibility = 'hidden';
     document.body.appendChild(link);
     link.click();
@@ -996,15 +1051,28 @@ export default function App() {
 
         {/* Desktop Sidebar Bottom */}
         <div className="p-5 border-t border-slate-200/80 bg-slate-50/70">
-          <button 
-            onClick={exportCSV}
-            disabled={images.length === 0}
-            className="w-full h-10 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl font-bold transition-all shadow-sm hover:shadow-md flex items-center justify-center gap-2 cursor-pointer mb-4 text-xs group"
-          >
-            <Download className="w-4 h-4 group-hover:translate-y-0.5 transition-transform" />
-            Export Collection
-            <span className="ml-auto text-[10px] opacity-70 font-mono">^S</span>
-          </button>
+          <div className="grid grid-cols-2 gap-2 mb-4">
+            <button 
+              type="button"
+              onClick={() => exportCSV('adobe')}
+              disabled={images.length === 0}
+              title="Export Adobe Stock / Shutterstock CSV (Ctrl+S)"
+              className="h-10 px-2.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl font-bold transition-all shadow-sm hover:shadow-md flex items-center justify-center gap-1.5 cursor-pointer text-[11px] group"
+            >
+              <Download className="w-3.5 h-3.5 shrink-0 group-hover:translate-y-0.5 transition-transform" />
+              <span className="truncate">Adobe CSV</span>
+            </button>
+            <button 
+              type="button"
+              onClick={() => exportCSV('freepik')}
+              disabled={images.length === 0}
+              title="Export Freepik CSV (semicolon-separated, no quotes)"
+              className="h-10 px-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl font-bold transition-all shadow-sm hover:shadow-md flex items-center justify-center gap-1.5 cursor-pointer text-[11px] group"
+            >
+              <Download className="w-3.5 h-3.5 shrink-0 group-hover:translate-y-0.5 transition-transform" />
+              <span className="truncate">Freepik CSV</span>
+            </button>
+          </div>
 
           <div className="flex items-center justify-between gap-2.5 px-1">
             <div className="flex items-center gap-2.5 min-w-0">
@@ -1035,16 +1103,7 @@ export default function App() {
       <main className="flex-1 relative overflow-y-auto custom-scrollbar h-full bg-[#f8fafc]">
         <div className="max-w-7xl mx-auto p-6 lg:p-12">
           
-          <AnimatePresence mode="wait">
-            {activeTab === 'metadata' && (
-              <motion.div
-                key="metadata"
-                initial={{ opacity: 0, y: 12 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -12 }}
-                transition={{ duration: 0.2 }}
-                className="space-y-6"
-              >
+            <div className={activeTab === 'metadata' ? 'space-y-6 block' : 'hidden'}>
                 {!settings.apiKeys.some(k => Boolean(k.key?.trim())) && (
                   <div className="bg-amber-50 border border-amber-200 p-4 rounded-2xl flex items-center gap-3.5 shadow-xs">
                     <div className="p-2 bg-amber-100 rounded-xl text-amber-700 shrink-0">
@@ -1136,8 +1195,10 @@ export default function App() {
                         <p className="text-lg font-bold text-slate-800">Drag & drop stock assets here</p>
                         <p className="text-slate-500 text-sm mt-1">or <span className="text-indigo-600 font-semibold underline underline-offset-2">browse files</span> from your computer</p>
                       </div>
-                      <div className="mt-7 flex items-center gap-3 text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+                      <div className="mt-7 flex flex-wrap items-center justify-center gap-3 text-[11px] font-bold text-slate-400 uppercase tracking-wider">
                         <span>JPEG & PNG</span>
+                        <span className="w-1 h-1 rounded-full bg-slate-300"></span>
+                        <span>PSD Templates</span>
                         <span className="w-1 h-1 rounded-full bg-slate-300"></span>
                         <span>AI & EPS Vectors</span>
                         <span className="w-1 h-1 rounded-full bg-slate-300"></span>
@@ -1174,7 +1235,7 @@ export default function App() {
                         {/* Batch Action Buttons */}
                         {(() => {
                           const pendingCount = images.filter(
-                            i => (i.status === 'idle' || i.status === 'error') && (Boolean(i.preview) || (i.type !== 'Vector' && i.type !== 'Video'))
+                            i => (i.status === 'idle' || i.status === 'error') && (Boolean(i.preview) || (i.type !== 'Vector' && i.type !== 'Video' && i.type !== 'PSD'))
                           ).length;
                           if (pendingCount === 0) return null;
                           const idleCount = images.filter(i => i.status === 'idle').length;
@@ -1203,12 +1264,23 @@ export default function App() {
                         </div>
 
                         <button 
-                          onClick={exportCSV}
-                          className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer"
-                          title="Export metadata as CSV"
+                          type="button"
+                          onClick={() => exportCSV('adobe')}
+                          className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer"
+                          title="Export metadata CSV for Adobe Stock / Shutterstock (comma-separated)"
                         >
                           <Download className="w-3.5 h-3.5" />
-                          Export CSV
+                          Adobe Stock CSV
+                        </button>
+
+                        <button 
+                          type="button"
+                          onClick={() => exportCSV('freepik')}
+                          className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer"
+                          title="Export metadata CSV for Freepik (semicolon-separated, without quotes)"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          Freepik CSV
                         </button>
 
                         <button 
@@ -1224,7 +1296,7 @@ export default function App() {
 
                     {/* Filter Pills */}
                     <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
-                      {(['all', 'Photo', 'Vector', 'Illustration', 'Video'] as const).map((type) => (
+                      {(['all', 'Photo', 'Vector', 'PSD', 'Illustration', 'Video'] as const).map((type) => (
                         <button
                           key={type}
                           onClick={() => setFilterType(type)}
@@ -1235,7 +1307,7 @@ export default function App() {
                               : "bg-white text-slate-600 border border-slate-200 hover:bg-slate-50 hover:text-slate-900"
                           )}
                         >
-                          {type === 'all' ? 'All Files' : `${type}s`}
+                          {type === 'all' ? 'All Files' : type === 'PSD' ? 'PSD Files' : `${type}s`}
                           <span className="ml-1.5 text-[10px] opacity-70">
                             ({type === 'all' ? images.length : images.filter(i => i.type === type).length})
                           </span>
@@ -1268,29 +1340,16 @@ export default function App() {
                     )}
                   </>
                 )}
-              </motion.div>
-            )}
+            </div>
 
-            {activeTab === 'studio' && (
-              <motion.div
-                key="studio"
-                initial={{ opacity: 0, y: 16 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -16 }}
-                transition={{ duration: 0.2 }}
-              >
+            {(activeTab === 'studio' || studioMounted) && (
+              <div key={`studio-${studioSessionKey}`} className={activeTab === 'studio' ? 'block' : 'hidden'}>
                 <FreepikConverter />
-              </motion.div>
+              </div>
             )}
 
-            {activeTab === 'techbg' && (
-              <motion.div
-                key="techbg"
-                initial={{ opacity: 0, y: 16 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -16 }}
-                transition={{ duration: 0.2 }}
-              >
+            {(activeTab === 'techbg' || techBgMounted) && (
+              <div key={`techbg-${studioSessionKey}`} className={activeTab === 'techbg' ? 'block' : 'hidden'}>
                 <BgStudio
                   geminiApiKey={
                     settings.apiKeys?.find((k) => k.id === settings.activeKeyId && k.provider === 'Gemini')?.key ||
@@ -1298,18 +1357,11 @@ export default function App() {
                     undefined
                   }
                 />
-              </motion.div>
+              </div>
             )}
 
             {activeTab === 'settings' && (
-              <motion.div
-                key="settings"
-                initial={{ opacity: 0, scale: 0.99 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0, scale: 0.99 }}
-                transition={{ duration: 0.2 }}
-                className="max-w-2xl mx-auto space-y-6"
-              >
+              <div className="max-w-2xl mx-auto space-y-6">
                 <header>
                   <h2 className="text-3xl font-bold tracking-tight text-slate-900 mb-1.5">AI Configuration</h2>
                   <p className="text-sm text-slate-500">Fine-tune how LensLogic analyzes your assets and configure your API keys.</p>
@@ -1520,20 +1572,14 @@ export default function App() {
                     />
                   </div>
                 </div>
-              </motion.div>
+              </div>
             )}
 
             {activeTab === 'admin' && userProfile?.role === 'admin' && (
-              <motion.div
-                key="admin"
-                initial={{ opacity: 0, scale: 0.99 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0, scale: 0.99 }}
-              >
+              <div>
                 <AdminPanel />
-              </motion.div>
+              </div>
             )}
-          </AnimatePresence>
 
         </div>
       </main>
@@ -1643,16 +1689,16 @@ const MetadataRow = React.memo(function MetadataRow({
           />
           
           {image.preview ? (
-            <div className={cn("relative w-full h-full", image.type === 'Vector' ? "bg-white" : "bg-slate-100")}>
+            <div className={cn("relative w-full h-full", (image.type === 'Vector' || image.type === 'PSD') ? "bg-white" : "bg-slate-100")}>
               <img
                 src={image.preview}
                 alt="preview"
                 className={cn(
                   "w-full h-full",
-                  image.type === 'Vector' ? "object-contain p-1.5" : "object-cover"
+                  (image.type === 'Vector' || image.type === 'PSD') ? "object-contain p-1.5" : "object-cover"
                 )}
               />
-              {(image.type === 'Vector' || image.type === 'Video') && (
+              {(image.type === 'Vector' || image.type === 'Video' || image.type === 'PSD') && (
                 <button 
                   onClick={() => fileInputRef.current?.click()}
                   className="absolute bottom-2 right-2 p-1.5 bg-slate-900/70 hover:bg-slate-900 text-white rounded-lg opacity-0 group-hover:opacity-100 transition-opacity backdrop-blur-sm cursor-pointer shadow-xs"
@@ -1669,11 +1715,13 @@ const MetadataRow = React.memo(function MetadataRow({
             >
               {image.type === 'Video' ? (
                 <VideoIcon className="w-7 h-7 mb-1 text-indigo-500 group-hover/preview:scale-110 transition-transform" />
+              ) : image.type === 'PSD' ? (
+                <Layers className="w-7 h-7 mb-1 text-indigo-500 group-hover/preview:scale-110 transition-transform" />
               ) : (
                 <Key className="w-7 h-7 mb-1 text-amber-500 group-hover/preview:scale-110 transition-transform" />
               )}
               <span className="text-[10px] font-bold uppercase text-slate-700">
-                {image.type === 'Video' ? 'Video File' : 'EPS/AI Vector'}
+                {image.type === 'Video' ? 'Video File' : image.type === 'PSD' ? 'Adobe PSD' : 'EPS/AI Vector'}
               </span>
               <p className="text-[9px] px-3 text-center mt-1.5 leading-tight text-indigo-600 font-bold uppercase">
                 + Upload JPG Preview
@@ -1681,7 +1729,7 @@ const MetadataRow = React.memo(function MetadataRow({
             </button>
           )}
           
-          {image.preview && (image.type === 'Video' || (image.type === 'Vector' && !(image.fileName || image.file?.name || '').toLowerCase().endsWith('.svg'))) && (
+          {image.preview && (image.type === 'Video' || image.type === 'PSD' || (image.type === 'Vector' && !(image.fileName || image.file?.name || '').toLowerCase().endsWith('.svg'))) && (
             <div className="absolute bottom-2 left-2 px-2 py-0.5 bg-emerald-600/90 backdrop-blur-sm rounded text-[8px] font-bold text-white flex items-center gap-1 shadow-xs">
               <Check className="w-2.5 h-2.5" /> PREVIEW READY
             </div>
@@ -1720,7 +1768,7 @@ const MetadataRow = React.memo(function MetadataRow({
                 </div>
                 <div className="text-left">
                   <p className="text-xs font-bold text-slate-900">{image.fileName || image.file?.name || 'Asset'}</p>
-                  {!image.preview && (image.type === 'Vector' || image.type === 'Video') ? (
+                  {!image.preview && (image.type === 'Vector' || image.type === 'Video' || image.type === 'PSD') ? (
                     <p className="text-[10px] text-amber-600 font-bold uppercase tracking-wide flex items-center gap-1 mt-0.5">
                       <AlertCircle className="w-3 h-3" /> Preview Image Required for AI
                     </p>
@@ -1747,7 +1795,7 @@ const MetadataRow = React.memo(function MetadataRow({
               <div className="flex items-center gap-2">
                 <button 
                   onClick={onGenerate}
-                  disabled={!image.preview && (image.type === 'Vector' || image.type === 'Video')}
+                  disabled={!image.preview && (image.type === 'Vector' || image.type === 'Video' || image.type === 'PSD')}
                   className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-200 disabled:text-slate-400 disabled:cursor-not-allowed text-white rounded-xl text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer"
                 >
                   <RefreshCw className="w-3.5 h-3.5" />

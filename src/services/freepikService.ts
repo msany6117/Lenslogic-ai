@@ -1,4 +1,4 @@
-import { writePsd, initializeCanvas, type Psd } from 'ag-psd';
+import { writePsd, readPsd, initializeCanvas, type Psd, type Layer } from 'ag-psd';
 import JSZip from 'jszip';
 
 // Initialize canvas helpers for browser environments
@@ -28,12 +28,17 @@ export interface FreepikPackOptions {
   addEditableBackgroundLayer?: boolean; // Add hidden toggleable background layer in PSD
   minPsdSizeBytes?: number; // 2MB = 2 * 1024 * 1024
   maxPsdSizeBytes?: number; // 200MB = 200 * 1024 * 1024
+  returnRawFiles?: boolean; // Skip per-item ZIP generation when packaging into a shared batch folder
 }
 
 export interface FreepikPackResult {
   zipBlob: Blob;
   zipUrl: string;
   zipFileName: string;
+  psdFileName?: string;
+  jpgFileName?: string;
+  psdBlob?: Blob;
+  jpgBlob?: Blob;
   psdSize: number;
   psdSizeFormatted: string;
   jpgSize: number;
@@ -444,11 +449,39 @@ export async function convertFileToFreepikPsdPack(
 
   const finalJpgBlob = await injectJfifDpi(rawJpgBlob, targetDpi);
 
-  // 4. Bundle both files into a single Freepik Submission ZIP Archive
-  const zip = new JSZip();
+  // 4. Bundle both files into a single Freepik Submission ZIP Archive (or return raw blobs for batch folder packaging)
   const psdFileName = `${baseName}.psd`;
   const jpgFileName = `${baseName}.jpg`;
+  const psdSizeBytes = finalPsdBytes.byteLength;
+  const isCompliant = psdSizeBytes >= MIN_PSD_SIZE && psdSizeBytes <= MAX_PSD_SIZE;
+  const zipFileName = `${baseName}_freepik_pack.zip`;
 
+  if (options.returnRawFiles) {
+    const psdBlob = new Blob([finalPsdBytes], { type: 'application/octet-stream' });
+    return {
+      zipBlob: new Blob(),
+      zipUrl: '',
+      zipFileName,
+      psdFileName,
+      jpgFileName,
+      psdBlob,
+      jpgBlob: finalJpgBlob,
+      psdSize: psdSizeBytes,
+      psdSizeFormatted: formatBytes(psdSizeBytes),
+      jpgSize: finalJpgBlob.size,
+      jpgSizeFormatted: formatBytes(finalJpgBlob.size),
+      dimensions: { width: docWidth, height: docHeight },
+      dpi: targetDpi,
+      isTransparent,
+      previewBgType,
+      isCompliant,
+      complianceMessage: isCompliant
+        ? `Freepik Verified: PSD size is ${formatBytes(psdSizeBytes)} (Within 2MB – 200MB required range)`
+        : `PSD size is ${formatBytes(psdSizeBytes)}`
+    };
+  }
+
+  const zip = new JSZip();
   zip.file(psdFileName, finalPsdBytes);
   zip.file(jpgFileName, finalJpgBlob);
 
@@ -459,15 +492,13 @@ export async function convertFileToFreepikPsdPack(
   });
 
   const zipUrl = URL.createObjectURL(zipBlob);
-  const zipFileName = `${baseName}_freepik_pack.zip`;
-
-  const psdSizeBytes = finalPsdBytes.byteLength;
-  const isCompliant = psdSizeBytes >= MIN_PSD_SIZE && psdSizeBytes <= MAX_PSD_SIZE;
 
   return {
     zipBlob,
     zipUrl,
     zipFileName,
+    psdFileName,
+    jpgFileName,
     psdSize: psdSizeBytes,
     psdSizeFormatted: formatBytes(psdSizeBytes),
     jpgSize: finalJpgBlob.size,
@@ -480,5 +511,97 @@ export async function convertFileToFreepikPsdPack(
     complianceMessage: isCompliant
       ? `Freepik Verified: PSD size is ${formatBytes(psdSizeBytes)} (Within 2MB – 200MB required range)`
       : `PSD size is ${formatBytes(psdSizeBytes)}`
+  };
+}
+
+export interface PsdPreviewInfo {
+  previewUrl: string;
+  width: number;
+  height: number;
+}
+
+function drawLayersRecursive(ctx: CanvasRenderingContext2D, layers: Layer[] | undefined, parentAlpha = 1) {
+  if (!layers || layers.length === 0) return;
+  for (const layer of layers) {
+    if (layer.hidden) continue;
+    const layerOpacity = typeof layer.opacity === 'number' ? Math.max(0, Math.min(1, layer.opacity)) : 1;
+    const effectiveAlpha = parentAlpha * layerOpacity;
+    if (layer.children && layer.children.length > 0) {
+      drawLayersRecursive(ctx, layer.children, effectiveAlpha);
+    } else if (layer.canvas && layer.canvas.width > 0 && layer.canvas.height > 0) {
+      ctx.save();
+      ctx.globalAlpha = effectiveAlpha;
+      ctx.drawImage(layer.canvas, layer.left || 0, layer.top || 0);
+      ctx.restore();
+    }
+  }
+}
+
+export async function loadPsdPreview(
+  file: File,
+  options: { maxDimension?: number } = {}
+): Promise<PsdPreviewInfo | null> {
+  const maxDimension = options.maxDimension || 1024;
+  const buffer = await file.arrayBuffer();
+
+  // Fast pass: read composite + embedded thumbnail without decoding every layer bitmap
+  let psd = readPsd(buffer, {
+    skipLayerImageData: true,
+    skipLinkedFilesData: true,
+    skipThumbnail: false,
+  });
+
+  let sourceCanvas: HTMLCanvasElement | null =
+    psd.canvas && psd.canvas.width > 0 && psd.canvas.height > 0
+      ? psd.canvas
+      : psd.imageResources?.thumbnail &&
+          psd.imageResources.thumbnail.width > 0 &&
+          psd.imageResources.thumbnail.height > 0
+        ? psd.imageResources.thumbnail
+        : null;
+
+  // Fallback pass: if PSD was saved without composite image, decode and composite visible layers
+  if (!sourceCanvas && psd.width > 0 && psd.height > 0) {
+    psd = readPsd(buffer, {
+      skipLayerImageData: false,
+      skipCompositeImageData: true,
+      skipLinkedFilesData: true,
+      skipThumbnail: true,
+    });
+    if (psd.children && psd.children.length > 0) {
+      const compCanvas = document.createElement('canvas');
+      compCanvas.width = psd.width;
+      compCanvas.height = psd.height;
+      const compCtx = compCanvas.getContext('2d');
+      if (compCtx) {
+        drawLayersRecursive(compCtx, psd.children, 1);
+        sourceCanvas = compCanvas;
+      }
+    }
+  }
+
+  if (!sourceCanvas || sourceCanvas.width <= 0 || sourceCanvas.height <= 0) {
+    return null;
+  }
+
+  const scale = Math.min(1, maxDimension / Math.max(1, sourceCanvas.width, sourceCanvas.height));
+  const outW = Math.max(1, Math.round(sourceCanvas.width * scale));
+  const outH = Math.max(1, Math.round(sourceCanvas.height * scale));
+
+  const outCanvas = document.createElement('canvas');
+  outCanvas.width = outW;
+  outCanvas.height = outH;
+  const outCtx = outCanvas.getContext('2d');
+  if (!outCtx) return null;
+
+  outCtx.imageSmoothingEnabled = true;
+  outCtx.imageSmoothingQuality = 'high';
+  outCtx.drawImage(sourceCanvas, 0, 0, outW, outH);
+
+  const previewUrl = outCanvas.toDataURL('image/png');
+  return {
+    previewUrl,
+    width: psd.width || sourceCanvas.width,
+    height: psd.height || sourceCanvas.height,
   };
 }

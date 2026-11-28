@@ -1,5 +1,5 @@
 export type Platform = 'Adobe Stock' | 'Shutterstock' | 'Freepik' | 'Getty Images' | 'Draft';
-export type AssetType = 'Photo' | 'Vector' | 'Illustration' | 'Video';
+export type AssetType = 'Photo' | 'Vector' | 'Illustration' | 'Video' | 'PSD';
 export type AiProvider = 'Gemini' | 'Groq';
 
 export interface ApiKeyEntry {

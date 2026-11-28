@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import JSZip from 'jszip';
 import { 
   Package, 
   Upload, 
@@ -17,13 +18,19 @@ import {
   CheckCheck,
   PenTool,
   FileCode2,
-  ShieldCheck
+  ShieldCheck,
+  FolderArchive,
+  Plus,
+  Trash2,
+  X
 } from 'lucide-react';
 import { useDropzone } from 'react-dropzone';
 import { 
   convertFileToFreepikPsdPack, 
   detectTransparency, 
+  formatBytes,
   loadImage, 
+  sanitizeFileName,
   type FreepikPackResult 
 } from '../services/freepikService';
 import { 
@@ -32,6 +39,42 @@ import {
   type FreepikVectorResult 
 } from '../services/vectorService';
 type StudioMode = 'psd' | 'vector';
+
+interface BatchPackageItem {
+  id: string;
+  file: File;
+  customPreviewFile?: File | null;
+  previewUrl: string | null;
+  width?: number;
+  height?: number;
+  isTransparent?: boolean;
+  status: 'idle' | 'processing' | 'done' | 'error';
+  error?: string;
+  pairName?: string;
+  assetSizeFormatted?: string;
+  jpgSizeFormatted?: string;
+  isCompliant?: boolean;
+}
+
+interface BatchZipResult {
+  zipUrl: string;
+  zipFileName: string;
+  folderName: string;
+  totalCount: number;
+  successCount: number;
+  failedCount: number;
+  zipSizeFormatted: string;
+  dpi: number;
+  mode: StudioMode;
+}
+
+function formatBatchPairName(index: number, total: number, prefix?: string): string {
+  const padLen = total >= 100 ? 3 : 2;
+  const num = String(index + 1).padStart(padLen, '0');
+  const trimmed = (prefix || '').trim();
+  if (!trimmed) return num;
+  return `${sanitizeFileName(trimmed)}_${num}`;
+}
 
 export interface DetectedDimensionInfo {
   width: number;
@@ -82,10 +125,18 @@ export default function FreepikConverter() {
   const [vectorResult, setVectorResult] = useState<FreepikVectorResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // Batch package queue state (activated automatically when 2+ files are uploaded)
+  const [batchItems, setBatchItems] = useState<BatchPackageItem[]>([]);
+  const [batchProgress, setBatchProgress] = useState<{ current: number; total: number; label: string } | null>(null);
+  const [batchZipResult, setBatchZipResult] = useState<BatchZipResult | null>(null);
+
   // Track active blob URLs for safe cleanup without leaks
   const previewUrlRef = useRef<string | null>(null);
   const psdZipUrlRef = useRef<string | null>(null);
   const vectorZipUrlRef = useRef<string | null>(null);
+  const batchZipUrlRef = useRef<string | null>(null);
+  const batchPreviewUrlsRef = useRef<Set<string>>(new Set());
+  const addMoreInputRef = useRef<HTMLInputElement | null>(null);
 
   const setSafePreviewUrl = (nextUrl: string | null) => {
     const prev = previewUrlRef.current;
@@ -101,16 +152,40 @@ export default function FreepikConverter() {
       if (previewUrlRef.current?.startsWith('blob:')) URL.revokeObjectURL(previewUrlRef.current);
       if (psdZipUrlRef.current?.startsWith('blob:')) URL.revokeObjectURL(psdZipUrlRef.current);
       if (vectorZipUrlRef.current?.startsWith('blob:')) URL.revokeObjectURL(vectorZipUrlRef.current);
+      if (batchZipUrlRef.current?.startsWith('blob:')) URL.revokeObjectURL(batchZipUrlRef.current);
+      batchPreviewUrlsRef.current.forEach((url) => {
+        if (url.startsWith('blob:')) URL.revokeObjectURL(url);
+      });
+      batchPreviewUrlsRef.current.clear();
     };
   }, []);
 
   const clearConversionResults = () => {
     if (psdZipUrlRef.current?.startsWith('blob:')) URL.revokeObjectURL(psdZipUrlRef.current);
     if (vectorZipUrlRef.current?.startsWith('blob:')) URL.revokeObjectURL(vectorZipUrlRef.current);
+    if (batchZipUrlRef.current?.startsWith('blob:')) URL.revokeObjectURL(batchZipUrlRef.current);
     psdZipUrlRef.current = null;
     vectorZipUrlRef.current = null;
+    batchZipUrlRef.current = null;
     setPsdResult(null);
     setVectorResult(null);
+    setBatchZipResult(null);
+  };
+
+  const clearBatchQueue = () => {
+    batchPreviewUrlsRef.current.forEach((url) => {
+      if (url.startsWith('blob:')) URL.revokeObjectURL(url);
+    });
+    batchPreviewUrlsRef.current.clear();
+    setBatchItems([]);
+    setBatchProgress(null);
+    clearConversionResults();
+    setSelectedFile(null);
+    setSafePreviewUrl(null);
+    setDetectedDimensions(null);
+    setCustomName('');
+    setCustomPreviewFile(null);
+    setError(null);
   };
 
   const applyAlphaUiState = (hasAlpha: boolean) => {
@@ -124,66 +199,207 @@ export default function FreepikConverter() {
     }
   };
 
-  const onDrop = async (acceptedFiles: File[]) => {
-    if (acceptedFiles.length > 0) {
-      const file = acceptedFiles[0];
-      const ext = file.name.split('.').pop()?.toLowerCase();
+  const inspectFileMetadata = async (file: File): Promise<{
+    previewUrl: string | null;
+    width?: number;
+    height?: number;
+    isTransparent: boolean;
+  }> => {
+    try {
+      const previewInfo = await loadVectorPreview(file);
+      return {
+        previewUrl: previewInfo.previewUrl || null,
+        width: previewInfo.width || undefined,
+        height: previewInfo.height || undefined,
+        isTransparent: Boolean(previewInfo.isTransparent),
+      };
+    } catch {
+      if (file.type && file.type.startsWith('image/') && !file.name.endsWith('.ai') && !file.name.endsWith('.eps')) {
+        try {
+          const url = URL.createObjectURL(file);
+          const img = await loadImage(url);
+          const w = img.naturalWidth || img.width;
+          const h = img.naturalHeight || img.height;
+          return {
+            previewUrl: url,
+            width: w || undefined,
+            height: h || undefined,
+            isTransparent: detectTransparency(img),
+          };
+        } catch {
+          return { previewUrl: null, isTransparent: false };
+        }
+      }
+      return { previewUrl: null, isTransparent: false };
+    }
+  };
 
-      // In Vector mode, Freepik contributor standard strictly requires original EPS files
-      if (studioMode === 'vector' && ext !== 'eps') {
-        setError('In Vector Mode, only authentic EPS (.eps) vector files are supported. Please upload an EPS file.');
+  const loadFilesIntoStudio = async (incomingFiles: File[], appendToBatch = false) => {
+    if (!incomingFiles || incomingFiles.length === 0) return;
+
+    const getExt = (f: File) => f.name.split('.').pop()?.toLowerCase() || '';
+    const getStem = (f: File) => f.name.replace(/\.[^/.]+$/, '').trim().toLowerCase();
+
+    const epsFiles = incomingFiles.filter((f) => getExt(f) === 'eps');
+    const rasterFiles = incomingFiles.filter((f) => ['jpg', 'jpeg', 'png', 'webp'].includes(getExt(f)));
+
+    // If vector files are dropped with matching preview images, pair them automatically
+    const previewMap = new Map<string, File>();
+    if (epsFiles.length > 0 && rasterFiles.length > 0) {
+      rasterFiles.forEach((rf) => previewMap.set(getStem(rf), rf));
+    }
+
+    const effectiveMode: StudioMode =
+      epsFiles.length > 0 && (studioMode === 'vector' || epsFiles.length === incomingFiles.length || previewMap.size === rasterFiles.length)
+        ? 'vector'
+        : studioMode;
+
+    if (effectiveMode === 'vector') {
+      if (epsFiles.length === 0) {
+        setError('In Vector Mode, only authentic EPS (.eps) vector files are supported. Please upload EPS files.');
         return;
       }
+      if (studioMode !== 'vector') {
+        setStudioMode('vector');
+      }
+    }
+
+    const targetFiles = effectiveMode === 'vector' ? epsFiles : incomingFiles;
+    const isNowBatch = appendToBatch ? (batchItems.length + targetFiles.length > 1 || (selectedFile !== null && targetFiles.length >= 1)) : targetFiles.length > 1;
+
+    // Preserve exact original single-file UX whenever total files === 1
+    if (!isNowBatch && targetFiles.length === 1) {
+      const file = targetFiles[0];
+      batchPreviewUrlsRef.current.forEach((url) => {
+        if (url.startsWith('blob:')) URL.revokeObjectURL(url);
+      });
+      batchPreviewUrlsRef.current.clear();
+      setBatchItems([]);
 
       setSelectedFile(file);
-      setCustomPreviewFile(null);
+      setCustomPreviewFile(previewMap.get(getStem(file)) || null);
       setCustomName(file.name.replace(/\.[^/.]+$/, ''));
       clearConversionResults();
       setError(null);
       setImgError(false);
 
-      if (ext === 'eps') {
-        setStudioMode('vector');
-      }
-
       setIsParsingPreview(true);
       try {
-        const previewInfo = await loadVectorPreview(file);
-        setSafePreviewUrl(previewInfo.previewUrl);
-        applyAlphaUiState(previewInfo.isTransparent);
-        if (previewInfo.width && previewInfo.height) {
+        const info = await inspectFileMetadata(file);
+        setSafePreviewUrl(info.previewUrl);
+        applyAlphaUiState(info.isTransparent);
+        if (info.width && info.height) {
           setDetectedDimensions({
-            width: previewInfo.width,
-            height: previewInfo.height,
-            aspect: getAspectRatioLabel(previewInfo.width, previewInfo.height)
+            width: info.width,
+            height: info.height,
+            aspect: getAspectRatioLabel(info.width, info.height)
           });
-        }
-      } catch (err: any) {
-        console.warn('Could not parse vector preview:', err);
-        if (file.type && file.type.startsWith('image/') && !file.name.endsWith('.ai') && !file.name.endsWith('.eps')) {
-          try {
-            const url = URL.createObjectURL(file);
-            setSafePreviewUrl(url);
-            const img = await loadImage(url);
-            const w = img.naturalWidth || img.width;
-            const h = img.naturalHeight || img.height;
-            if (w && h) {
-              setDetectedDimensions({ width: w, height: h, aspect: getAspectRatioLabel(w, h) });
-            }
-            applyAlphaUiState(detectTransparency(img));
-          } catch {
-            setSafePreviewUrl(null);
-          }
-        } else {
-          setSafePreviewUrl(null);
         }
       } finally {
         setIsParsingPreview(false);
       }
+      return;
+    }
+
+    // Multi-file Batch Mode
+    setError(null);
+    setImgError(false);
+    clearConversionResults();
+
+    const existingItems: BatchPackageItem[] = appendToBatch
+      ? batchItems.length > 0
+        ? batchItems
+        : selectedFile
+          ? [{
+              id: `${Date.now()}_0`,
+              file: selectedFile,
+              customPreviewFile: customPreviewFile,
+              previewUrl: previewUrl,
+              width: detectedDimensions?.width,
+              height: detectedDimensions?.height,
+              isTransparent: isTransparentDetected,
+              status: 'idle',
+            }]
+          : []
+      : [];
+
+    if (!appendToBatch) {
+      batchPreviewUrlsRef.current.forEach((url) => {
+        if (url.startsWith('blob:')) URL.revokeObjectURL(url);
+      });
+      batchPreviewUrlsRef.current.clear();
+      // Clear single-file name so automatic sequential numbering (01, 02, 03...) applies by default
+      setCustomName('');
+    } else {
+      if (selectedFile && previewUrl && previewUrl.startsWith('blob:')) {
+        batchPreviewUrlsRef.current.add(previewUrl);
+        if (previewUrlRef.current === previewUrl) {
+          previewUrlRef.current = null;
+        }
+      }
+      if (existingItems.length === 1 && customName === existingItems[0].file.name.replace(/\.[^/.]+$/, '')) {
+        setCustomName('');
+      }
+    }
+
+    setSelectedFile(null);
+    setSafePreviewUrl(null);
+    setCustomPreviewFile(null);
+
+    const newBatchEntries: BatchPackageItem[] = targetFiles.map((file, idx) => ({
+      id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}_${idx}`,
+      file,
+      customPreviewFile: previewMap.get(getStem(file)) || null,
+      previewUrl: null,
+      status: 'idle',
+    }));
+
+    const combined = [...existingItems, ...newBatchEntries];
+    setBatchItems(combined);
+    setIsParsingPreview(true);
+
+    try {
+      let appliedFirstAlpha = existingItems.length > 0;
+      for (const item of newBatchEntries) {
+        const info = await inspectFileMetadata(item.file);
+        if (info.previewUrl && info.previewUrl.startsWith('blob:')) {
+          batchPreviewUrlsRef.current.add(info.previewUrl);
+        }
+        if (!appliedFirstAlpha) {
+          appliedFirstAlpha = true;
+          applyAlphaUiState(info.isTransparent);
+          if (info.width && info.height) {
+            setDetectedDimensions({
+              width: info.width,
+              height: info.height,
+              aspect: getAspectRatioLabel(info.width, info.height)
+            });
+          }
+        }
+        setBatchItems((prev) =>
+          prev.map((row) =>
+            row.id === item.id
+              ? {
+                  ...row,
+                  previewUrl: info.previewUrl,
+                  width: info.width,
+                  height: info.height,
+                  isTransparent: info.isTransparent,
+                }
+              : row
+          )
+        );
+      }
+    } finally {
+      setIsParsingPreview(false);
     }
   };
 
-  const { getRootProps, getInputProps, isDragActive } = useDropzone({
+  const onDrop = async (acceptedFiles: File[]) => {
+    await loadFilesIntoStudio(acceptedFiles, false);
+  };
+
+  const { getRootProps, getInputProps } = useDropzone({
     onDrop,
     accept: studioMode === 'vector'
       ? {
@@ -198,56 +414,236 @@ export default function FreepikConverter() {
           'application/illustrator': ['.ai'],
           'application/pdf': ['.ai']
         } as any,
-    maxFiles: 1,
-    multiple: false
+    multiple: true
   } as any);
 
+  const removeBatchItem = (id: string) => {
+    const target = batchItems.find((i) => i.id === id);
+    if (target?.previewUrl?.startsWith('blob:')) {
+      URL.revokeObjectURL(target.previewUrl);
+      batchPreviewUrlsRef.current.delete(target.previewUrl);
+    }
+    const next = batchItems.filter((i) => i.id !== id);
+    if (next.length === 0) {
+      setBatchItems([]);
+      setDetectedDimensions(null);
+    } else if (next.length === 1) {
+      const remaining = next[0];
+      if (remaining.previewUrl) {
+        batchPreviewUrlsRef.current.delete(remaining.previewUrl);
+      }
+      setBatchItems([]);
+      setSelectedFile(remaining.file);
+      setCustomPreviewFile(remaining.customPreviewFile || null);
+      setCustomName(remaining.file.name.replace(/\.[^/.]+$/, ''));
+      setSafePreviewUrl(remaining.previewUrl);
+      setImgError(false);
+      applyAlphaUiState(Boolean(remaining.isTransparent));
+      if (remaining.width && remaining.height) {
+        setDetectedDimensions({
+          width: remaining.width,
+          height: remaining.height,
+          aspect: getAspectRatioLabel(remaining.width, remaining.height)
+        });
+      } else {
+        setDetectedDimensions(null);
+      }
+    } else {
+      setBatchItems(next);
+    }
+    clearConversionResults();
+  };
+
   const handleConvert = async () => {
-    if (!selectedFile && !previewUrl) return;
+    const isBatchMode = batchItems.length > 1;
+    if (!isBatchMode && !selectedFile && !previewUrl) return;
+    if (isBatchMode && batchItems.length === 0) return;
+
     setIsConverting(true);
     setError(null);
 
     try {
-      const source = selectedFile || previewUrl!;
-      const baseTitle = customName || 'freepik_asset';
+      if (isBatchMode) {
+        clearConversionResults();
+        const total = batchItems.length;
+        const folderName = studioMode === 'vector' ? 'Freepik_Vector_EPS_Pack' : 'Freepik_PSD_Pack';
+        const masterZip = new JSZip();
+        const folder = masterZip.folder(folderName)!;
 
-      if (studioMode === 'vector') {
-        // Package Freepik Vector EPS Pack (1MB - 70MB) with 100% original dimensions
-        const vResult = await convertFileToFreepikVectorPack(source, baseTitle, {
-          baseName: baseTitle,
-          targetWidth: detectedDimensions?.width,
-          targetHeight: detectedDimensions?.height,
-          dpi: customDpi,
-          customPreviewSource: customPreviewFile || undefined
+        setBatchItems((prev) => prev.map((it) => ({ ...it, status: 'idle', error: undefined })));
+
+        let successCount = 0;
+        let failedCount = 0;
+
+        for (let i = 0; i < total; i++) {
+          const item = batchItems[i];
+          const pairName = formatBatchPairName(i, total, customName);
+          const ext = studioMode === 'vector' ? 'eps' : 'psd';
+
+          setBatchProgress({
+            current: i + 1,
+            total,
+            label: `${pairName}.${ext} + ${pairName}.jpg (${item.file.name})`
+          });
+          setBatchItems((prev) =>
+            prev.map((row) => (row.id === item.id ? { ...row, status: 'processing', pairName } : row))
+          );
+
+          try {
+            if (studioMode === 'vector') {
+              const vResult = await convertFileToFreepikVectorPack(item.file, pairName, {
+                baseName: pairName,
+                targetWidth: item.width,
+                targetHeight: item.height,
+                dpi: customDpi,
+                previewBgStyle,
+                backgroundColor: bgColor,
+                customPreviewSource: item.customPreviewFile || undefined,
+                returnRawFiles: true,
+              });
+              if (vResult.epsBlob && vResult.jpgBlob) {
+                folder.file(`${pairName}.eps`, vResult.epsBlob);
+                folder.file(`${pairName}.jpg`, vResult.jpgBlob);
+              }
+              successCount++;
+              setBatchItems((prev) =>
+                prev.map((row) =>
+                  row.id === item.id
+                    ? {
+                        ...row,
+                        status: 'done',
+                        pairName,
+                        assetSizeFormatted: vResult.epsSizeFormatted,
+                        jpgSizeFormatted: vResult.jpgSizeFormatted,
+                        isCompliant: vResult.isCompliant,
+                      }
+                    : row
+                )
+              );
+            } else {
+              const pResult = await convertFileToFreepikPsdPack(item.file, pairName, {
+                baseName: pairName,
+                targetWidth: item.width,
+                targetHeight: item.height,
+                dpi: customDpi,
+                transparentPsd: enableTransparentPsd,
+                previewBgStyle,
+                backgroundColor: bgColor,
+                addEditableBackgroundLayer: addEditableBgLayer,
+                returnRawFiles: true,
+              });
+              if (pResult.psdBlob && pResult.jpgBlob) {
+                folder.file(`${pairName}.psd`, pResult.psdBlob);
+                folder.file(`${pairName}.jpg`, pResult.jpgBlob);
+              }
+              successCount++;
+              setBatchItems((prev) =>
+                prev.map((row) =>
+                  row.id === item.id
+                    ? {
+                        ...row,
+                        status: 'done',
+                        pairName,
+                        assetSizeFormatted: pResult.psdSizeFormatted,
+                        jpgSizeFormatted: pResult.jpgSizeFormatted,
+                        isCompliant: pResult.isCompliant,
+                      }
+                    : row
+                )
+              );
+            }
+          } catch (itemErr: any) {
+            failedCount++;
+            setBatchItems((prev) =>
+              prev.map((row) =>
+                row.id === item.id
+                  ? { ...row, status: 'error', pairName, error: itemErr?.message || 'Conversion failed' }
+                  : row
+              )
+            );
+          }
+
+          // Brief yield so browser UI stays smooth during heavy batch canvas/PSD encoding
+          await new Promise((r) => setTimeout(r, 20));
+        }
+
+        if (successCount === 0) {
+          throw new Error('All files failed to package. Please check the file formats and try again.');
+        }
+
+        setBatchProgress({ current: total, total, label: `Archiving ${successCount} pairs into ${folderName}/...` });
+        const masterZipBlob = await masterZip.generateAsync({
+          type: 'blob',
+          compression: 'DEFLATE',
+          compressionOptions: { level: 3 }
         });
-        clearConversionResults();
-        vectorZipUrlRef.current = vResult.zipUrl;
-        setVectorResult(vResult);
+        const masterZipUrl = URL.createObjectURL(masterZipBlob);
+        batchZipUrlRef.current = masterZipUrl;
+
+        setBatchZipResult({
+          zipUrl: masterZipUrl,
+          zipFileName: `${folderName}.zip`,
+          folderName,
+          totalCount: total,
+          successCount,
+          failedCount,
+          zipSizeFormatted: formatBytes(masterZipBlob.size),
+          dpi: customDpi,
+          mode: studioMode,
+        });
       } else {
-        // Convert to Freepik PSD Pack (2MB - 200MB) with 100% original dimensions
-        const pResult = await convertFileToFreepikPsdPack(source, baseTitle, {
-          baseName: baseTitle,
-          targetWidth: detectedDimensions?.width,
-          targetHeight: detectedDimensions?.height,
-          dpi: customDpi,
-          transparentPsd: enableTransparentPsd,
-          previewBgStyle: previewBgStyle,
-          backgroundColor: bgColor,
-          addEditableBackgroundLayer: addEditableBgLayer
-        });
-        clearConversionResults();
-        psdZipUrlRef.current = pResult.zipUrl;
-        setPsdResult(pResult);
+        const activeFile = batchItems.length === 1 ? batchItems[0].file : selectedFile;
+        const source = activeFile || previewUrl!;
+        const baseTitle = customName || 'freepik_asset';
+
+        if (studioMode === 'vector') {
+          // Package Freepik Vector EPS Pack (1MB - 70MB) with 100% original dimensions
+          const vResult = await convertFileToFreepikVectorPack(source, baseTitle, {
+            baseName: baseTitle,
+            targetWidth: detectedDimensions?.width,
+            targetHeight: detectedDimensions?.height,
+            dpi: customDpi,
+            customPreviewSource: customPreviewFile || undefined
+          });
+          clearConversionResults();
+          vectorZipUrlRef.current = vResult.zipUrl;
+          setVectorResult(vResult);
+        } else {
+          // Convert to Freepik PSD Pack (2MB - 200MB) with 100% original dimensions
+          const pResult = await convertFileToFreepikPsdPack(source, baseTitle, {
+            baseName: baseTitle,
+            targetWidth: detectedDimensions?.width,
+            targetHeight: detectedDimensions?.height,
+            dpi: customDpi,
+            transparentPsd: enableTransparentPsd,
+            previewBgStyle: previewBgStyle,
+            backgroundColor: bgColor,
+            addEditableBackgroundLayer: addEditableBgLayer
+          });
+          clearConversionResults();
+          psdZipUrlRef.current = pResult.zipUrl;
+          setPsdResult(pResult);
+        }
       }
     } catch (err: any) {
       console.error('Freepik conversion error:', err);
       setError(err?.message || 'Failed to convert file into Freepik pack.');
     } finally {
       setIsConverting(false);
+      setBatchProgress(null);
     }
   };
 
   const handleDownload = () => {
+    if (batchZipResult) {
+      const a = document.createElement('a');
+      a.href = batchZipResult.zipUrl;
+      a.download = batchZipResult.zipFileName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      return;
+    }
     const activeResult = studioMode === 'vector' ? vectorResult : psdResult;
     if (!activeResult) return;
     const a = document.createElement('a');
@@ -259,6 +655,7 @@ export default function FreepikConverter() {
   };
 
   const activeResult = studioMode === 'vector' ? vectorResult : psdResult;
+  const isBatchMode = batchItems.length > 1;
 
   return (
     <div className="max-w-5xl mx-auto space-y-8 pb-12">
@@ -370,6 +767,22 @@ export default function FreepikConverter() {
       <div className="space-y-8">
         {/* Upload Section */}
         <div className="space-y-6">
+          {/* Hidden input for adding more files into batch without replacing existing ones */}
+          <input
+            ref={addMoreInputRef}
+            type="file"
+            multiple
+            accept={studioMode === 'vector' ? '.eps,.jpg,.jpeg,.png' : 'image/*,.eps,.ai'}
+            className="sr-only"
+            onChange={(e) => {
+              const files: File[] = e.target.files ? (Array.from(e.target.files) as File[]) : [];
+              if (files.length > 0) {
+                loadFilesIntoStudio(files, true);
+              }
+              e.target.value = '';
+            }}
+          />
+
           {/* Dropzone */}
           <div 
             {...getRootProps()}
@@ -381,7 +794,7 @@ export default function FreepikConverter() {
           >
             <input {...getInputProps()} />
             
-            {isParsingPreview ? (
+            {isParsingPreview && !isBatchMode ? (
               <div className="py-12 space-y-4">
                 <div className="w-14 h-14 rounded-2xl bg-amber-50 text-amber-600 flex items-center justify-center mx-auto border border-amber-200">
                   <RefreshCw className="w-7 h-7 animate-spin" />
@@ -391,6 +804,111 @@ export default function FreepikConverter() {
                   <p className="text-xs text-slate-500 mt-1 max-w-xs mx-auto">
                     Extracting vector paths and generating high-res preview for {selectedFile?.name}
                   </p>
+                </div>
+              </div>
+            ) : isBatchMode ? (
+              <div className="space-y-4 text-left" onClick={(e) => e.stopPropagation()}>
+                <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-100">
+                  <div className="flex items-center gap-2.5">
+                    <div className={`w-9 h-9 rounded-xl flex items-center justify-center ${
+                      studioMode === 'vector' ? 'bg-amber-50 text-amber-600' : 'bg-indigo-50 text-indigo-600'
+                    }`}>
+                      <FolderArchive className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <p className="text-sm font-bold text-slate-900">
+                        {batchItems.length} Files Ready for 1-Click Batch Folder
+                      </p>
+                      <p className="text-[11px] text-slate-500">
+                        Each {studioMode === 'vector' ? 'EPS' : 'PSD'} + JPG preview pair gets an automatic numbered name inside one folder
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={isConverting}
+                      onClick={() => addMoreInputRef.current?.click()}
+                      className="px-3 py-1.5 bg-indigo-50 hover:bg-indigo-100 disabled:opacity-40 text-indigo-700 rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer transition-colors"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      Add More
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isConverting}
+                      onClick={clearBatchQueue}
+                      className="px-3 py-1.5 bg-rose-50 hover:bg-rose-100 disabled:opacity-40 text-rose-700 rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer transition-colors"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      Clear All
+                    </button>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 max-h-[360px] overflow-y-auto pr-1">
+                  {batchItems.map((item, idx) => {
+                    const ext = studioMode === 'vector' ? 'eps' : 'psd';
+                    const previewPairName = item.pairName || formatBatchPairName(idx, batchItems.length, customName);
+                    return (
+                      <div
+                        key={item.id}
+                        className="flex items-center gap-3 p-2.5 rounded-2xl border border-slate-200 bg-slate-50/70 relative group/item"
+                      >
+                        <div className="w-12 h-12 rounded-xl overflow-hidden border border-slate-200 bg-white shrink-0 flex items-center justify-center">
+                          {item.previewUrl ? (
+                            <img src={item.previewUrl} alt={item.file.name} className="w-full h-full object-cover" />
+                          ) : (
+                            <FileCode2 className="w-5 h-5 text-amber-600" />
+                          )}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700 shrink-0">
+                              #{previewPairName}
+                            </span>
+                            <p className="text-xs font-bold text-slate-800 truncate">{item.file.name}</p>
+                          </div>
+                          <p className="text-[10px] text-slate-500 font-mono truncate mt-0.5">
+                            → {previewPairName}.{ext} &amp; {previewPairName}.jpg
+                          </p>
+                          <div className="flex items-center gap-2 mt-0.5">
+                            {item.width && item.height && (
+                              <span className="text-[9px] text-slate-400 font-mono">
+                                {item.width}×{item.height}
+                              </span>
+                            )}
+                            {item.status === 'processing' && (
+                              <span className="text-[9px] font-bold text-indigo-600 flex items-center gap-1">
+                                <RefreshCw className="w-2.5 h-2.5 animate-spin" />
+                                Packaging...
+                              </span>
+                            )}
+                            {item.status === 'done' && (
+                              <span className="text-[9px] font-bold text-emerald-700">
+                                ✓ {item.assetSizeFormatted}
+                              </span>
+                            )}
+                            {item.status === 'error' && (
+                              <span className="text-[9px] font-bold text-rose-600 truncate" title={item.error}>
+                                Failed
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                        {!isConverting && (
+                          <button
+                            type="button"
+                            onClick={() => removeBatchItem(item.id)}
+                            className="p-1 text-slate-400 hover:text-rose-600 rounded-lg hover:bg-rose-50 transition-colors cursor-pointer shrink-0"
+                            title="Remove file"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             ) : selectedFile || previewUrl ? (
@@ -445,7 +963,20 @@ export default function FreepikConverter() {
                       {detectedDimensions.width} × {detectedDimensions.height} px • {detectedDimensions.aspect}
                     </p>
                   )}
-                  <p className="text-[11px] text-indigo-600 font-semibold mt-0.5">Click or drag another file to replace</p>
+                  <div className="flex items-center justify-center gap-3 mt-1">
+                    <p className="text-[11px] text-indigo-600 font-semibold">Click or drag files to replace</p>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        addMoreInputRef.current?.click();
+                      }}
+                      className="px-2.5 py-1 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-[11px] font-bold flex items-center gap-1 cursor-pointer transition-colors"
+                    >
+                      <Plus className="w-3 h-3" />
+                      Add More for Batch
+                    </button>
+                  </div>
                 </div>
               </div>
             ) : (
@@ -457,13 +988,13 @@ export default function FreepikConverter() {
                 </div>
                 <h3 className="text-base font-bold text-slate-900">
                   {studioMode === 'vector' 
-                    ? 'Upload Original EPS Vector File (.eps)' 
-                    : 'Upload Any Image or Graphic File'}
+                    ? 'Upload Original EPS Vector Files (.eps)' 
+                    : 'Upload Single or Multiple Image Files'}
                 </h3>
                 <p className="text-xs text-slate-500 mt-1 max-w-sm mx-auto">
                   {studioMode === 'vector'
-                    ? 'Drag & drop your original EPS file. The vector file is preserved, a matching JPEG preview is generated, and both are packaged into a standard ZIP archive (1MB–70MB).'
-                    : 'Drag & drop PNG (with or without transparency), JPG, SVG, WebP to generate a 2MB–200MB Layered PSD Pack.'}
+                    ? 'Drag & drop one or multiple EPS files at once. Vector files are preserved with matching JPEG previews, auto-numbered, and packaged together (1MB–70MB).'
+                    : 'Drag & drop one or multiple PNG, JPG, SVG, WebP files at once to generate 2MB–200MB Layered PSD Packs.'}
                 </p>
                 <span className={`inline-block mt-4 px-4 py-2 text-xs font-bold rounded-xl transition-colors ${
                   studioMode === 'vector'
@@ -501,17 +1032,27 @@ export default function FreepikConverter() {
             {/* Base File Name */}
             <div className="space-y-1.5">
               <label className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">
-                Asset Name ({studioMode === 'vector' ? 'for EPS & JPG' : 'for PSD & JPG'})
+                {isBatchMode
+                  ? `Batch Name Prefix (${studioMode === 'vector' ? 'Auto Numbered EPS & JPG' : 'Auto Numbered PSD & JPG'})`
+                  : `Asset Name (${studioMode === 'vector' ? 'for EPS & JPG' : 'for PSD & JPG'})`}
               </label>
               <input 
                 type="text"
                 value={customName}
                 onChange={(e) => setCustomName(e.target.value)}
-                placeholder="e.g. isometric_vector_elements"
+                placeholder={isBatchMode ? 'Optional prefix (leave blank for 01, 02, 03...)' : 'e.g. isometric_vector_elements'}
                 className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-xs font-semibold text-slate-800 focus:outline-none focus:border-indigo-500"
               />
               <p className="text-[10px] text-slate-400">
-                Generates <code>{customName || 'asset'}.{studioMode === 'vector' ? 'eps' : 'psd'}</code> and <code>{customName || 'asset'}.jpg</code>
+                {isBatchMode ? (
+                  <>
+                    Generates <code>{formatBatchPairName(0, batchItems.length, customName)}.{studioMode === 'vector' ? 'eps' : 'psd'}</code> + <code>{formatBatchPairName(0, batchItems.length, customName)}.jpg</code>, <code>{formatBatchPairName(1, batchItems.length, customName)}.{studioMode === 'vector' ? 'eps' : 'psd'}</code> + <code>{formatBatchPairName(1, batchItems.length, customName)}.jpg</code> ...
+                  </>
+                ) : (
+                  <>
+                    Generates <code>{customName || 'asset'}.{studioMode === 'vector' ? 'eps' : 'psd'}</code> and <code>{customName || 'asset'}.jpg</code>
+                  </>
+                )}
               </p>
             </div>
 
@@ -787,7 +1328,27 @@ export default function FreepikConverter() {
                 </span>
               </div>
 
-              {detectedDimensions ? (
+              {isBatchMode ? (
+                <div className="p-5 bg-gradient-to-br from-indigo-50/70 via-slate-50 to-white rounded-2xl border border-indigo-100/80 shadow-xs space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Batch Packaging Summary</p>
+                      <p className="text-xl font-extrabold text-slate-900 tracking-tight font-mono mt-0.5">
+                        {batchItems.length} Pairs ({batchItems.length * 2} Files)
+                      </p>
+                    </div>
+                    <span className="px-3 py-1 bg-white border border-slate-200/90 rounded-xl text-xs font-bold text-indigo-700 shadow-2xs">
+                      1 Output Folder
+                    </span>
+                  </div>
+                  <div className="flex items-start gap-2 bg-emerald-50/70 p-3 rounded-xl border border-emerald-100">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                    <p className="text-[11px] text-emerald-900 leading-relaxed">
+                      <strong>Auto-Numbered &amp; Original Proportions:</strong> Every file preserves its own original pixel dimensions and receives matching sequential names (<code>01</code>, <code>02</code>, <code>03</code>...) inside one folder.
+                    </p>
+                  </div>
+                </div>
+              ) : detectedDimensions ? (
                 <div className="p-5 bg-gradient-to-br from-indigo-50/70 via-slate-50 to-white rounded-2xl border border-indigo-100/80 shadow-xs space-y-4">
                   <div className="flex items-center justify-between">
                     <div>
@@ -843,9 +1404,28 @@ export default function FreepikConverter() {
 
         {/* Convert Trigger Button & Error Banner */}
         <div className="pt-4 border-t border-slate-100 space-y-3">
+          {batchProgress && (
+            <div className="p-3.5 bg-indigo-50/70 border border-indigo-200 rounded-2xl space-y-2">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-bold text-indigo-950 truncate">
+                  Packaging {batchProgress.current} of {batchProgress.total}: {batchProgress.label}
+                </span>
+                <span className="font-mono font-bold text-indigo-700 shrink-0 ml-2">
+                  {Math.round((batchProgress.current / Math.max(1, batchProgress.total)) * 100)}%
+                </span>
+              </div>
+              <div className="w-full h-2 rounded-full bg-indigo-200/60 overflow-hidden">
+                <div
+                  className="h-full bg-indigo-600 rounded-full transition-all duration-300"
+                  style={{ width: `${(batchProgress.current / Math.max(1, batchProgress.total)) * 100}%` }}
+                />
+              </div>
+            </div>
+          )}
+
           <button
             onClick={handleConvert}
-            disabled={(!selectedFile && !previewUrl) || isConverting}
+            disabled={(!isBatchMode && !selectedFile && !previewUrl) || (isBatchMode && batchItems.length === 0) || isConverting}
             className={`w-full py-4 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl text-sm font-bold transition-all shadow-md flex items-center justify-center gap-2 cursor-pointer ${
               studioMode === 'vector'
                 ? 'bg-amber-600 hover:bg-amber-700 shadow-amber-600/20'
@@ -855,16 +1435,22 @@ export default function FreepikConverter() {
             {isConverting ? (
               <>
                 <RefreshCw className="w-4 h-4 animate-spin" />
-                {studioMode === 'vector'
-                  ? 'Packaging Original EPS & Preview (1MB–70MB)...'
-                  : 'Generating 2MB–200MB Layered PSD Pack...'}
+                {isBatchMode
+                  ? `Generating Batch Folder (${batchProgress?.current || 1}/${batchItems.length})...`
+                  : studioMode === 'vector'
+                    ? 'Packaging Original EPS & Preview (1MB–70MB)...'
+                    : 'Generating 2MB–200MB Layered PSD Pack...'}
               </>
             ) : (
               <>
-                {studioMode === 'vector' ? <PenTool className="w-4 h-4" /> : <Package className="w-4 h-4" />}
-                {studioMode === 'vector'
-                  ? 'Package EPS & Preview (ZIP)'
-                  : 'Generate PSD Pack (ZIP)'}
+                {isBatchMode ? <FolderArchive className="w-4 h-4" /> : studioMode === 'vector' ? <PenTool className="w-4 h-4" /> : <Package className="w-4 h-4" />}
+                {isBatchMode
+                  ? studioMode === 'vector'
+                    ? `Package All ${batchItems.length} EPS & Previews in 1 Folder (ZIP)`
+                    : `Generate All ${batchItems.length} PSD & Previews in 1 Folder (ZIP)`
+                  : studioMode === 'vector'
+                    ? 'Package EPS & Preview (ZIP)'
+                    : 'Generate PSD Pack (ZIP)'}
               </>
             )}
           </button>
@@ -878,8 +1464,55 @@ export default function FreepikConverter() {
         </div>
       </div>
 
+      {/* Batch Results Box */}
+      {batchZipResult && batchZipResult.mode === studioMode && (
+        <div className="bg-emerald-50/60 border border-emerald-200 rounded-3xl p-6 shadow-xs space-y-4 animate-in fade-in slide-in-from-bottom-2 duration-300">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-emerald-900 font-bold text-xs">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+              Batch Folder Ready! ({batchZipResult.successCount} {batchZipResult.mode === 'vector' ? 'EPS + JPG' : 'PSD + JPG'} Pairs)
+            </div>
+            <span className="text-[10px] font-bold px-2.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-200 flex items-center gap-1 font-mono">
+              <FolderArchive className="w-3 h-3 text-emerald-600" />
+              {batchZipResult.folderName}/ • {batchZipResult.zipSizeFormatted}
+            </span>
+          </div>
+
+          <div className="bg-white rounded-2xl border border-emerald-100 p-4 space-y-2 max-h-64 overflow-y-auto text-xs">
+            {batchItems.filter((it) => it.status === 'done').map((it) => {
+              const ext = batchZipResult.mode === 'vector' ? 'eps' : 'psd';
+              return (
+                <div key={it.id} className="flex items-center justify-between py-1.5 border-b border-slate-100 last:border-b-0">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <Check className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                    <span className="font-mono font-bold text-slate-800">
+                      {batchZipResult.folderName}/{it.pairName}.{ext}
+                    </span>
+                    <span className="text-slate-400">+</span>
+                    <span className="font-mono font-semibold text-indigo-700">
+                      {it.pairName}.jpg
+                    </span>
+                  </div>
+                  <div className="text-right font-mono text-[11px] text-slate-600 shrink-0 ml-2">
+                    {it.assetSizeFormatted} + {it.jpgSizeFormatted}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <button
+            onClick={handleDownload}
+            className="w-full py-3.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-emerald-600/20 flex items-center justify-center gap-2 cursor-pointer"
+          >
+            <Download className="w-4 h-4" />
+            Download All in One Folder ({batchZipResult.zipFileName})
+          </button>
+        </div>
+      )}
+
       {/* Results Box */}
-      {activeResult && (
+      {!(batchZipResult && batchZipResult.mode === studioMode) && activeResult && (
         <div className="bg-emerald-50/60 border border-emerald-200 rounded-3xl p-6 shadow-xs space-y-4 animate-in fade-in slide-in-from-bottom-2 duration-300">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2 text-emerald-900 font-bold text-xs">

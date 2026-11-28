@@ -14,7 +14,7 @@ import {
   isQuotaOrRateError,
   isTransientBusyError,
   parseImageDataPayload,
-} from "./api/_geminiShared.js";
+} from "./api/_geminiShared.ts";
 
 dotenv.config();
 

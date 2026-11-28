@@ -52,6 +52,7 @@ export interface FreepikVectorOptions {
   minEpsSizeBytes?: number; // 1MB = 1 * 1024 * 1024
   maxEpsSizeBytes?: number; // 70MB = 70 * 1024 * 1024
   customPreviewSource?: File | Blob | string; // Optional user-provided custom preview image
+  returnRawFiles?: boolean; // Skip per-item ZIP generation when packaging into a shared batch folder
 }
 
 export interface FreepikVectorResult {
@@ -60,6 +61,8 @@ export interface FreepikVectorResult {
   zipFileName: string;
   epsFileName: string;
   jpgFileName: string;
+  epsBlob?: Blob;
+  jpgBlob?: Blob;
   epsSize: number;
   epsSizeFormatted: string;
   jpgSize: number;
@@ -2160,11 +2163,38 @@ export async function convertFileToFreepikVectorPack(
   // Inject user-selected DPI JFIF segment
   const finalJpgBlob = await injectJfif300Dpi(rawJpgBlob, targetDpi);
 
-  // 3. Bundle both files into Freepik ZIP Archive
-  const zip = new JSZip();
+  // 3. Bundle both files into Freepik ZIP Archive (or return raw blobs for batch folder packaging)
   const epsFileName = `${baseName}.eps`;
   const jpgFileName = `${baseName}.jpg`;
+  const zipFileName = `${baseName}_freepik_vector_pack.zip`;
+  const epsSizeBytes = finalEpsBytes.byteLength;
+  const isCompliant = epsSizeBytes >= MIN_EPS_SIZE && epsSizeBytes <= MAX_EPS_SIZE;
 
+  if (options.returnRawFiles) {
+    const epsBlob = new Blob([finalEpsBytes], { type: 'application/postscript' });
+    return {
+      zipBlob: new Blob(),
+      zipUrl: '',
+      zipFileName,
+      epsFileName,
+      jpgFileName,
+      epsBlob,
+      jpgBlob: finalJpgBlob,
+      epsSize: epsSizeBytes,
+      epsSizeFormatted: formatBytes(epsSizeBytes),
+      jpgSize: finalJpgBlob.size,
+      jpgSizeFormatted: formatBytes(finalJpgBlob.size),
+      dimensions: { width: previewWidth, height: previewHeight },
+      dpi: targetDpi,
+      isCompliant,
+      complianceMessage: isCompliant
+        ? `Freepik Verified: EPS size is ${formatBytes(epsSizeBytes)} (Within 1MB – 70MB required range)`
+        : `EPS size is ${formatBytes(epsSizeBytes)}`,
+      sourceType
+    };
+  }
+
+  const zip = new JSZip();
   zip.file(epsFileName, finalEpsBytes);
   zip.file(jpgFileName, finalJpgBlob);
 
@@ -2175,10 +2205,6 @@ export async function convertFileToFreepikVectorPack(
   });
 
   const zipUrl = URL.createObjectURL(zipBlob);
-  const zipFileName = `${baseName}_freepik_vector_pack.zip`;
-
-  const epsSizeBytes = finalEpsBytes.byteLength;
-  const isCompliant = epsSizeBytes >= MIN_EPS_SIZE && epsSizeBytes <= MAX_EPS_SIZE;
 
   return {
     zipBlob,

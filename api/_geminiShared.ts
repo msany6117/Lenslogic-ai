@@ -154,6 +154,14 @@ export function getFormatLabel(
 ): { extUpper: string; phrase: string } {
   const ext = (fileExtension || "").toLowerCase().replace(/^\./, "");
   const extUpper = ext.toUpperCase();
+  if (ext === "psd" || assetType === "PSD") {
+    return {
+      extUpper: "PSD",
+      phrase: isTransparent
+        ? "transparent layered PSD template"
+        : "layered PSD Photoshop template",
+    };
+  }
   if (ext === "eps") return { extUpper: "EPS", phrase: "EPS vector illustration" };
   if (ext === "ai") return { extUpper: "AI", phrase: "AI vector illustration" };
   if (ext === "svg") return { extUpper: "SVG", phrase: "SVG vector graphic" };
