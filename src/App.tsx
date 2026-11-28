@@ -21,7 +21,8 @@ import {
   Sliders,
   Cpu,
   Eye,
-  EyeOff
+  EyeOff,
+  Globe
 } from 'lucide-react';
 import { useDropzone } from 'react-dropzone';
 import Papa from 'papaparse';
@@ -36,6 +37,8 @@ import AuthScreen from './components/AuthScreen';
 import AdminPanel from './components/AdminPanel';
 import FreepikConverter from './components/FreepikConverter';
 import BgStudio from './components/BgStudio';
+import HomePage from './components/HomePage';
+import AboutPage from './components/AboutPage';
 
 export default function App() {
   const [user, setUser] = useState<any>(null);
@@ -45,7 +48,7 @@ export default function App() {
   const [images, setImages] = useState<ImageMetadata[]>([]);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
-  const [activeTab, setActiveTab] = useState<'metadata' | 'studio' | 'techbg' | 'settings' | 'admin'>('metadata');
+  const [activeTab, setActiveTab] = useState<'home' | 'about' | 'metadata' | 'studio' | 'techbg' | 'settings' | 'admin'>('home');
   const [studioMounted, setStudioMounted] = useState(false);
   const [techBgMounted, setTechBgMounted] = useState(false);
   const [studioSessionKey, setStudioSessionKey] = useState(0);
@@ -691,7 +694,7 @@ export default function App() {
   const exportCSV = (format: 'adobe' | 'freepik' = 'adobe') => {
     const dateStamp = new Date().toISOString().slice(0, 10);
     let csv = '';
-    let downloadName = `LensLogic_AdobeStock_${dateStamp}.csv`;
+    let downloadName = `Metafy_AdobeStock_${dateStamp}.csv`;
 
     if (format === 'freepik') {
       const sanitizeFreepikCell = (val: string) =>
@@ -713,7 +716,7 @@ export default function App() {
         return `${filename};${title};${tags}`;
       });
       csv = [header, ...rows].join('\n');
-      downloadName = `LensLogic_Freepik_${dateStamp}.csv`;
+      downloadName = `Metafy_Freepik_${dateStamp}.csv`;
     } else {
       const data = imagesRef.current.map(img => ({
         Filename: img.fileName || img.file?.name || "unnamed_asset",
@@ -812,7 +815,26 @@ export default function App() {
   });
 
   return (
-    <div className="flex h-screen bg-[#f8fafc] font-sans text-slate-800 overflow-hidden relative selection:bg-indigo-100 selection:text-indigo-900">
+    <>
+      {activeTab === 'home' && (
+        <div className="h-screen overflow-y-auto bg-[#f8fafc] custom-scrollbar">
+          <HomePage
+            onNavigate={(tab) => setActiveTab(tab)}
+            assetCount={images.length}
+          />
+        </div>
+      )}
+
+      {activeTab === 'about' && (
+        <div className="h-screen overflow-y-auto bg-[#f8fafc] custom-scrollbar">
+          <AboutPage
+            onNavigate={(tab) => setActiveTab(tab)}
+            assetCount={images.length}
+          />
+        </div>
+      )}
+
+      <div className={activeTab === 'home' || activeTab === 'about' ? 'hidden' : 'flex h-screen bg-[#f8fafc] font-sans text-slate-800 overflow-hidden relative selection:bg-indigo-100 selection:text-indigo-900'}>
       {/* Custom Clear Confirmation Dialog */}
       {showClearConfirm && (
         <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
@@ -879,22 +901,27 @@ export default function App() {
       {/* Dynamic Ambient Background */}
       <div className="absolute inset-0 pointer-events-none overflow-hidden">
         <div className="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] bg-indigo-100/60 blur-[140px] rounded-full pointer-events-none"></div>
-        <div className="absolute bottom-[-10%] right-[-10%] w-[45%] h-[45%] bg-purple-100/50 blur-[140px] rounded-full pointer-events-none"></div>
+        <div className="absolute bottom-[-10%] right-[-10%] w-[45%] h-[45%] bg-sky-100/50 blur-[140px] rounded-full pointer-events-none"></div>
       </div>
 
       {/* Sidebar (Desktop Studio Style - Light Theme) */}
       <aside className="w-72 h-full bg-white/90 backdrop-blur-xl border-r border-slate-200/80 flex flex-col z-30 shadow-xs">
         <div className="p-6 flex-1 overflow-y-auto custom-scrollbar">
-          {/* Logo */}
-          <div className="flex items-center gap-3 mb-8 px-1">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-indigo-600 to-indigo-700 flex items-center justify-center shadow-md shadow-indigo-600/25 ring-1 ring-white/50">
-              <ImageIcon className="text-white w-5 h-5" />
+          {/* Logo — Click to return Home */}
+          <button
+            type="button"
+            onClick={() => setActiveTab('home')}
+            title="Back to Home"
+            className="block mb-7 px-1 text-left cursor-pointer focus:outline-none"
+          >
+            <div className="w-[140px] h-[40px] overflow-hidden flex items-center">
+              <img
+                src="/assets/aistudio/i008iu__1__c82bac29.png"
+                alt="Metafy"
+                className="w-full h-auto max-w-none mix-blend-multiply"
+              />
             </div>
-            <div>
-              <h1 className="text-base font-bold tracking-tight text-slate-900 leading-none">LensLogic Studio</h1>
-              <p className="text-[10px] text-indigo-600 font-bold uppercase tracking-[0.18em] mt-1.5">Desktop Edition</p>
-            </div>
-          </div>
+          </button>
 
           <div className="space-y-6">
             <nav className="space-y-1.5">
@@ -1031,71 +1058,58 @@ export default function App() {
               </div>
             )}
 
-              {/* Smart Batch Engine Badge in Sidebar */}
-              <div className="p-3 bg-slate-50 border border-slate-200/70 rounded-xl">
-                <div className="flex items-center justify-between mb-1.5">
-                  <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-700">
-                    <Sparkles className="w-3.5 h-3.5 text-indigo-600" />
-                    <span>Unlimited Key Engine</span>
-                  </div>
-                  <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200">
-                    Active
-                  </span>
-                </div>
-                <p className="text-[10px] text-slate-500 leading-relaxed">
-                  No app limits. Runs on your own API keys with automatic multi-key rotation &amp; retry recovery.
-                </p>
-              </div>
             </div>
           </div>
 
-        {/* Desktop Sidebar Bottom */}
-        <div className="p-5 border-t border-slate-200/80 bg-slate-50/70">
-          <div className="grid grid-cols-2 gap-2 mb-4">
-            <button 
-              type="button"
-              onClick={() => exportCSV('adobe')}
-              disabled={images.length === 0}
-              title="Export Adobe Stock / Shutterstock CSV (Ctrl+S)"
-              className="h-10 px-2.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl font-bold transition-all shadow-sm hover:shadow-md flex items-center justify-center gap-1.5 cursor-pointer text-[11px] group"
-            >
-              <Download className="w-3.5 h-3.5 shrink-0 group-hover:translate-y-0.5 transition-transform" />
-              <span className="truncate">Adobe CSV</span>
-            </button>
-            <button 
-              type="button"
-              onClick={() => exportCSV('freepik')}
-              disabled={images.length === 0}
-              title="Export Freepik CSV (semicolon-separated, no quotes)"
-              className="h-10 px-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl font-bold transition-all shadow-sm hover:shadow-md flex items-center justify-center gap-1.5 cursor-pointer text-[11px] group"
-            >
-              <Download className="w-3.5 h-3.5 shrink-0 group-hover:translate-y-0.5 transition-transform" />
-              <span className="truncate">Freepik CSV</span>
-            </button>
+        {/* Desktop Sidebar Bottom — Developer Credit & Links */}
+        <div className="p-4 border-t border-slate-200/80 bg-slate-50/80 space-y-2.5">
+          <div className="flex items-center justify-between px-1">
+            <span className="text-[10px] font-semibold text-slate-500 tracking-wide">
+              Developed By
+            </span>
+            <span className="text-xs font-extrabold tracking-tight text-slate-900">
+              SNY247™
+            </span>
           </div>
 
-          <div className="flex items-center justify-between gap-2.5 px-1">
-            <div className="flex items-center gap-2.5 min-w-0">
-              <div className="w-8 h-8 rounded-full bg-slate-200 border border-slate-300 overflow-hidden flex items-center justify-center shrink-0">
-                 <img src={`https://api.dicebear.com/7.x/avataaars/svg?seed=${user?.uid || 'Felix'}`} alt="avatar" className="w-full h-full" />
-              </div>
-              <div className="flex-1 min-w-0">
-                <p className="text-xs font-bold text-slate-900 truncate">
-                  {userProfile?.displayName || userProfile?.email || 'Guest Workspace'}
-                </p>
-                <p className="text-[10px] text-indigo-600 font-bold uppercase truncate">
-                  {userProfile?.role === 'admin' ? 'Studio Admin' : 'Creator'}
-                </p>
-              </div>
-            </div>
-            <button 
-              onClick={handleSignOut}
-              className="p-1.5 hover:bg-slate-200 text-slate-500 hover:text-rose-600 rounded-lg transition-colors cursor-pointer"
-              title="Reset Workspace Session"
+          <div className="grid grid-cols-2 gap-2">
+            <a
+              href="https://sny247.vercel.app/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="h-9 px-2.5 bg-white hover:bg-indigo-50 text-slate-700 hover:text-indigo-700 border border-slate-200 hover:border-indigo-200 rounded-xl font-bold transition-all duration-200 hover:-translate-y-0.5 shadow-2xs flex items-center justify-center gap-1.5 text-[11px]"
+              title="Visit SNY247™ Website"
             >
-              <RotateCcw className="w-4 h-4" />
-            </button>
+              <Globe className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+              <span>Website</span>
+            </a>
+
+            <a
+              href="https://wa.me/8801618985090"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="h-9 px-2.5 bg-white hover:bg-indigo-50 text-slate-700 hover:text-indigo-700 border border-slate-200 hover:border-indigo-200 rounded-xl font-bold transition-all duration-200 hover:-translate-y-0.5 shadow-2xs flex items-center justify-center gap-1.5 text-[11px]"
+              title="Chat on WhatsApp (01618985090)"
+            >
+              <svg viewBox="0 0 24 24" fill="currentColor" className="w-3.5 h-3.5 text-emerald-600 shrink-0" aria-hidden="true">
+                <path d="M12.04 2c-5.46 0-9.91 4.45-9.91 9.91 0 1.75.46 3.45 1.32 4.95L2.05 22l5.25-1.38c1.45.79 3.08 1.21 4.74 1.21 5.46 0 9.91-4.45 9.91-9.91 0-2.65-1.03-5.14-2.9-7.01A9.816 9.816 0 0 0 12.04 2m5.79 14.01c-.24.68-1.41 1.3-1.95 1.38-.5.07-1.13.1-1.82-.12-.42-.13-.96-.31-1.65-.61-2.91-1.26-4.81-4.19-4.96-4.38-.14-.19-1.18-1.57-1.18-3 0-1.43.75-2.13 1.01-2.42.27-.29.58-.36.77-.36.19 0 .39 0 .56.01.18.01.42-.07.66.5.24.58.82 2 .89 2.15.07.15.12.32.02.51-.1.19-.15.32-.29.49-.14.17-.31.38-.44.51-.15.15-.3.31-.13.6.17.29.75 1.24 1.62 2.01 1.11.99 2.05 1.3 2.34 1.44.29.15.46.12.63-.07.17-.19.72-.84.91-1.13.19-.29.39-.24.65-.15.27.1 1.69.8 1.98.94.29.15.48.22.55.34.07.12.07.7-.17 1.38Z" />
+              </svg>
+              <span>WhatsApp</span>
+            </a>
           </div>
+
+          <a
+            href="https://www.youtube.com/channel/UCV6frnsNl3RMtXbCTU57Z2A?sub_confirmation=1"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="w-full h-9 px-3 bg-slate-900 hover:bg-indigo-600 text-white rounded-xl font-bold transition-all duration-200 hover:-translate-y-0.5 shadow-xs hover:shadow flex items-center justify-center gap-2 text-[11px]"
+            title="Subscribe to SNY247™ on YouTube"
+          >
+            <svg viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4 text-rose-400 shrink-0" aria-hidden="true">
+              <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z" />
+            </svg>
+            <span>Subscribe on YouTube</span>
+          </a>
         </div>
       </aside>
 
@@ -1168,13 +1182,9 @@ export default function App() {
                 {images.length === 0 ? (
                   <div className="space-y-8">
                     <header>
-                      <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-indigo-50 border border-indigo-200/60 text-indigo-700 text-xs font-semibold mb-3">
-                        <Sparkles className="w-3.5 h-3.5" />
-                        AI Stock Asset Optimization
-                      </div>
                       <h2 className="text-3xl lg:text-4xl font-bold tracking-tight text-slate-900 mb-2">Metadata Generator</h2>
                       <p className="text-slate-600 text-base max-w-xl">
-                        Batch generate high-converting titles, descriptions, and keywords optimized for Adobe Stock, Shutterstock, and Freepik.
+                        Generate your Assets Metadata for Adobe Stock, Shutterstock, and Freepik.
                       </p>
                     </header>
 
@@ -1364,7 +1374,7 @@ export default function App() {
               <div className="max-w-2xl mx-auto space-y-6">
                 <header>
                   <h2 className="text-3xl font-bold tracking-tight text-slate-900 mb-1.5">AI Configuration</h2>
-                  <p className="text-sm text-slate-500">Fine-tune how LensLogic analyzes your assets and configure your API keys.</p>
+                  <p className="text-sm text-slate-500">Fine-tune how Metafy analyzes your assets and configure your API keys.</p>
                 </header>
 
                 <div className="bg-white rounded-3xl border border-slate-200/90 p-7 space-y-7 shadow-xs">
@@ -1584,6 +1594,7 @@ export default function App() {
         </div>
       </main>
     </div>
+    </>
   );
 }
 

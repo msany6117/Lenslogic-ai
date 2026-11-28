@@ -18,7 +18,6 @@ import {
   CheckCheck,
   PenTool,
   FileCode2,
-  ShieldCheck,
   FolderArchive,
   Plus,
   Trash2,
@@ -661,62 +660,12 @@ export default function FreepikConverter() {
     <div className="max-w-5xl mx-auto space-y-8 pb-12">
       {/* Header Banner */}
       <header className="bg-white rounded-3xl border border-slate-200/90 p-8 shadow-xs relative overflow-hidden">
-        <div className="absolute top-0 right-0 w-96 h-96 bg-gradient-to-bl from-indigo-100/60 via-purple-100/30 to-transparent rounded-full blur-3xl pointer-events-none" />
+        <div className="absolute top-0 right-0 w-96 h-96 bg-gradient-to-bl from-indigo-100/60 via-sky-100/35 to-transparent rounded-full blur-3xl pointer-events-none" />
         
-        <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-6 relative z-10">
-          <div>
-            <h2 className="text-3xl font-bold tracking-tight text-slate-900">
-              EPS & PSD Package Generator
-            </h2>
-          </div>
-
-          <div className="flex flex-col sm:flex-row gap-3 shrink-0">
-            {studioMode === 'vector' ? (
-              <>
-                <div className="p-3 bg-slate-50 border border-slate-200/80 rounded-2xl flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-xl bg-amber-50 text-amber-700 border border-amber-200 flex items-center justify-center shrink-0">
-                    <PenTool className="w-4 h-4" />
-                  </div>
-                  <div className="text-left">
-                    <p className="text-[11px] font-bold text-slate-800 leading-none">Vector EPS Format</p>
-                    <p className="text-[10px] text-slate-500 mt-0.5">Illustrator 10 EPS + JPG</p>
-                  </div>
-                </div>
-
-                <div className="p-3 bg-slate-50 border border-slate-200/80 rounded-2xl flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-xl bg-emerald-50 text-emerald-700 border border-emerald-200 flex items-center justify-center shrink-0">
-                    <ShieldCheck className="w-4 h-4" />
-                  </div>
-                  <div className="text-left">
-                    <p className="text-[11px] font-bold text-slate-800 leading-none">EPS Size Guaranteed</p>
-                    <p className="text-[10px] text-emerald-700 font-bold mt-0.5">Strictly 1MB – 70MB</p>
-                  </div>
-                </div>
-              </>
-            ) : (
-              <>
-                <div className="p-3 bg-slate-50 border border-slate-200/80 rounded-2xl flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-xl bg-emerald-50 text-emerald-700 border border-emerald-200 flex items-center justify-center shrink-0">
-                    <Check className="w-4 h-4" />
-                  </div>
-                  <div className="text-left">
-                    <p className="text-[11px] font-bold text-slate-800 leading-none">PSD Size Guaranteed</p>
-                    <p className="text-[10px] text-emerald-700 font-bold mt-0.5">Strictly 2MB – 200MB</p>
-                  </div>
-                </div>
-
-                <div className="p-3 bg-slate-50 border border-slate-200/80 rounded-2xl flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-xl bg-indigo-50 text-indigo-700 border border-indigo-200 flex items-center justify-center shrink-0">
-                    <Layers className="w-4 h-4" />
-                  </div>
-                  <div className="text-left">
-                    <p className="text-[11px] font-bold text-slate-800 leading-none">{customDpi} PPI & Alpha</p>
-                    <p className="text-[10px] text-slate-500 mt-0.5">Transparent PSD Ready</p>
-                  </div>
-                </div>
-              </>
-            )}
-          </div>
+        <div className="relative z-10">
+          <h2 className="text-3xl font-bold tracking-tight text-slate-900">
+            EPS & PSD Package Generator
+          </h2>
         </div>
 
         {/* Studio Mode Selector (Tabs) */}

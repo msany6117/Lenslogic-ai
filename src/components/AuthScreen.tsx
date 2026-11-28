@@ -3,7 +3,6 @@ import {
   Mail, 
   Lock, 
   Sparkles, 
-  Image as ImageIcon, 
   UserPlus, 
   LogIn, 
   AlertCircle,
@@ -90,17 +89,18 @@ export default function AuthScreen({ onAuthSuccess, onCancel }: AuthScreenProps)
     <div className="min-h-screen bg-[#f8fafc] text-slate-800 flex flex-col items-center justify-center p-6 relative overflow-hidden font-sans">
       {/* Background Soft Ambient Lights */}
       <div className="absolute top-[-15%] left-[-15%] w-[55%] h-[55%] bg-indigo-100/50 blur-[130px] rounded-full pointer-events-none"></div>
-      <div className="absolute bottom-[-15%] right-[-15%] w-[55%] h-[55%] bg-purple-100/40 blur-[130px] rounded-full pointer-events-none"></div>
+      <div className="absolute bottom-[-15%] right-[-15%] w-[55%] h-[55%] bg-sky-100/45 blur-[130px] rounded-full pointer-events-none"></div>
 
       <div className="w-full max-w-md z-10">
         {/* Header/Logo */}
         <div className="flex flex-col items-center mb-8">
-          <div className="w-14 h-14 rounded-2xl bg-indigo-600 flex items-center justify-center shadow-lg shadow-indigo-500/25 ring-4 ring-indigo-50 mb-3.5 transition-transform hover:scale-105">
-            <ImageIcon className="text-white w-7 h-7" />
+          <div className="w-[210px] h-[64px] overflow-hidden flex items-center justify-center mb-2">
+            <img
+              src="/assets/aistudio/i008iu__1__c82bac29.png"
+              alt="Metafy"
+              className="w-full h-auto max-w-none mix-blend-multiply"
+            />
           </div>
-          <h1 className="text-2xl font-bold tracking-tight text-slate-900 mb-1">
-            LensLogic <span className="text-indigo-600">Studio</span>
-          </h1>
           <p className="text-slate-500 text-xs text-center max-w-xs leading-relaxed">
             AI-Powered Metadata Studio for Stock Image Contributors
           </p>

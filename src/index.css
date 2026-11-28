@@ -7,6 +7,23 @@
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
   --animate-shimmer: shimmer 2s infinite linear;
 
+  /* Metafy Brand Palette: Electric Royal Blue + Midnight Navy */
+  --color-indigo-50: #eef5ff;
+  --color-indigo-100: #dceafe;
+  --color-indigo-200: #bfdbfe;
+  --color-indigo-300: #93c5fd;
+  --color-indigo-400: #3b82f6;
+  --color-indigo-500: #0066ff;
+  --color-indigo-600: #0057ff;
+  --color-indigo-700: #0046d6;
+  --color-indigo-800: #0838a8;
+  --color-indigo-900: #0b2a73;
+  --color-indigo-950: #0b162c;
+
+  --color-slate-800: #16223a;
+  --color-slate-900: #0b162c;
+  --color-slate-950: #071021;
+
   @keyframes shimmer {
     0% { transform: translateX(-100%); }
     100% { transform: translateX(300%); }

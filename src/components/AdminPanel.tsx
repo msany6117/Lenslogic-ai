@@ -121,7 +121,7 @@ export default function AdminPanel() {
             Studio Administration
           </h2>
           <p className="text-slate-500 text-xs mt-1">
-            Global operational overview of LensLogic Studio. Real-time platform metrics.
+            Global operational overview of Metafy. Real-time platform metrics.
           </p>
         </div>
         <button

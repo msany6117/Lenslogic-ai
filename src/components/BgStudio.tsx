@@ -19,18 +19,13 @@ import {
   Square,
   CheckSquare,
   Dices,
-  Brain,
   Lock,
   Unlock,
   RotateCcw,
   ChevronDown,
-  ImagePlus,
-  Code2,
-  Sparkles,
 } from 'lucide-react';
 import {
   ASPECT_RATIOS,
-  AiBlueprint,
   BG_TAXONOMY,
   CATEGORY_OPTIONS,
   COLOR_STYLES,
@@ -40,7 +35,6 @@ import {
   ExportFormat,
   ExportSettings,
   GeneratedBackground,
-  ReferenceImagePayload,
   ResolutionPreset,
   StockQualityReport,
   SymmetryMode,
@@ -54,7 +48,6 @@ import {
   generateGenerationId,
   generateRandomSeed,
   renderBackgroundToCanvas,
-  requestAiBlueprints,
   resolvePaletteHexPreview,
 } from '../services/techBgEngine';
 import { analyzeStockQuality } from '../services/techBgQuality';
@@ -62,45 +55,11 @@ import { cn } from '../lib/utils';
 
 const PREVIEW_MAX_EDGE = 1120;
 
-async function fileToReferencePayload(file: File): Promise<ReferenceImagePayload> {
-  const objectUrl = URL.createObjectURL(file);
-  try {
-    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-      const el = new Image();
-      el.onload = () => resolve(el);
-      el.onerror = () => reject(new Error('Could not read reference image file.'));
-      el.src = objectUrl;
-    });
-    const maxEdge = 768;
-    const scale = Math.min(1, maxEdge / Math.max(1, img.width, img.height));
-    const w = Math.max(64, Math.round(img.width * scale));
-    const h = Math.max(64, Math.round(img.height * scale));
-    const canvas = document.createElement('canvas');
-    canvas.width = w;
-    canvas.height = h;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) throw new Error('Canvas unavailable for reference image.');
-    ctx.fillStyle = '#0f172a';
-    ctx.fillRect(0, 0, w, h);
-    ctx.drawImage(img, 0, 0, w, h);
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.84);
-    const commaIdx = dataUrl.indexOf(',');
-    const data = commaIdx >= 0 ? dataUrl.slice(commaIdx + 1) : dataUrl;
-    return {
-      mimeType: 'image/jpeg',
-      data,
-      previewUrl: dataUrl,
-    };
-  } finally {
-    URL.revokeObjectURL(objectUrl);
-  }
-}
-
 function cloneTechBgParams(p: TechBgParams): TechBgParams {
   return {
     ...p,
     customPalette: { ...p.customPalette },
-    aiBlueprint: p.aiBlueprint ? { ...p.aiBlueprint } : undefined,
+    aiBlueprint: undefined,
   };
 }
 
@@ -131,8 +90,12 @@ function clampNum(v: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, v));
 }
 
-export default function BgStudio({ geminiApiKey }: BgStudioProps) {
-  const [params, setParams] = useState<TechBgParams>(DEFAULT_TECH_BG_PARAMS);
+export default function BgStudio(_props: BgStudioProps) {
+  const [params, setParams] = useState<TechBgParams>(() => ({
+    ...DEFAULT_TECH_BG_PARAMS,
+    useAiDirector: false,
+    aiBlueprint: undefined,
+  }));
   const [exportSettings, setExportSettings] = useState<ExportSettings>({
     format: 'png',
     quality: 94,
@@ -159,25 +122,14 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
     supportsTransparency: true,
   });
 
-  const [isThinking, setIsThinking] = useState(false);
-  const [isRefining, setIsRefining] = useState(false);
   const [isRenderingStage, setIsRenderingStage] = useState(false);
   const [isSavingToGallery, setIsSavingToGallery] = useState(false);
   const [justSavedGallery, setJustSavedGallery] = useState(false);
   const [stageQualityReport, setStageQualityReport] = useState<StockQualityReport | null>(null);
   const [showQualityDrawer, setShowQualityDrawer] = useState(false);
-  const [showCodeDrawer, setShowCodeDrawer] = useState(false);
-  const [editableGlsl, setEditableGlsl] = useState('');
-  const [editableCanvas, setEditableCanvas] = useState('');
-  const [refineInstruction, setRefineInstruction] = useState('');
-  const [referenceImage, setReferenceImage] = useState<ReferenceImagePayload | null>(null);
-  const refImageInputRef = useRef<HTMLInputElement | null>(null);
   const gallerySectionRef = useRef<HTMLElement | null>(null);
   const [copiedSeed, setCopiedSeed] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-
-  // Recent AI concept names to prevent repetitive generation across runs
-  const recentConceptsRef = useRef<string[]>([]);
 
   // Batch & Gallery State
   const [gallery, setGallery] = useState<GeneratedBackground[]>([]);
@@ -222,18 +174,12 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
   const batchMenuRef = useRef<HTMLDivElement | null>(null);
 
   const stageAbortRef = useRef<AbortController | null>(null);
-  const thinkAbortRef = useRef<AbortController | null>(null);
   const batchAbortRef = useRef<AbortController | null>(null);
   const exportAbortRef = useRef<AbortController | null>(null);
   const stageUrlRef = useRef<string>('');
 
   const targetDims = useMemo(() => resolveTargetDimensions(params), [params]);
   const livePalette = useMemo(() => resolvePaletteHexPreview(params), [params]);
-
-  useEffect(() => {
-    setEditableGlsl(params.aiBlueprint?.glslCode || '');
-    setEditableCanvas(params.aiBlueprint?.canvasCode || '');
-  }, [params.aiBlueprint]);
 
   useEffect(() => {
     if (!showBatchMenu) return;
@@ -250,7 +196,6 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
   useEffect(() => {
     return () => {
       stageAbortRef.current?.abort();
-      thinkAbortRef.current?.abort();
       batchAbortRef.current?.abort();
       exportAbortRef.current?.abort();
       if (stageUrlRef.current.startsWith('blob:')) {
@@ -275,7 +220,6 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
       try {
         const res = await renderBackgroundToCanvas(params, {
           previewMaxEdge: PREVIEW_MAX_EDGE,
-          apiKey: geminiApiKey,
           signal: controller.signal,
         });
         if (controller.signal.aborted) return;
@@ -330,7 +274,7 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
       clearTimeout(timer);
       controller.abort();
     };
-  }, [geminiApiKey, params, showQualityDrawer]);
+  }, [params, showQualityDrawer]);
 
   const updateParam = useCallback(<K extends keyof TechBgParams>(key: K, value: TechBgParams[K]) => {
     setParams((prev) => {
@@ -372,177 +316,15 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
     });
   }, []);
 
-  const applyBlueprintToParams = useCallback(
-    (base: TechBgParams, bp: AiBlueprint): TechBgParams => {
-      recentConceptsRef.current = [
-        ...recentConceptsRef.current.slice(-14),
-        `${bp.conceptTitle} (${bp.styleName || bp.resolvedCategory})`,
-      ];
-      const deg = ((Math.round(bp.lightAngleDeg || 0) % 360) + 360) % 360;
-      return {
-        ...base,
-        seed: base.seedLocked ? base.seed : generateRandomSeed(),
-        density: clampNum(Math.round((bp.densityFactor || 0.55) * 100), 15, 95),
-        scale: clampNum(Math.round((bp.geometryScale || 1) * 100), 55, 160),
-        rotation: deg,
-        glowIntensity: clampNum(Math.round((bp.glowFactor || 0.5) * 100), 10, 95),
-        depth: clampNum(Math.round((bp.depthFactor || 0.65) * 100), 15, 95),
-        aiBlueprint: bp,
-      };
-    },
-    []
-  );
-
-  // Invoke Gemini Creative Director + Market Analyst to invent bespoke procedural code
-  const runAiThink = useCallback(
-    async (overrideRef?: ReferenceImagePayload | null, isRefineMode = false) => {
-      if (isThinking || isRefining) return;
-      setErrorMsg(null);
-
-      if (!params.useAiDirector && !isRefineMode && !overrideRef) {
-        setParams((prev) => ({
-          ...prev,
-          seed: prev.seedLocked ? prev.seed : generateRandomSeed(),
-          aiBlueprint: undefined,
-        }));
-        return;
-      }
-
-      thinkAbortRef.current?.abort();
-      const controller = new AbortController();
-      thinkAbortRef.current = controller;
-      if (isRefineMode) setIsRefining(true);
-      else setIsThinking(true);
-
-      const isFreshRefUpload = Boolean(overrideRef);
-
-      try {
-        const resolvedStyleName = isFreshRefUpload
-          ? 'ai-invention'
-          : params.styleSelection === 'ai-invention'
-            ? 'ai-invention'
-            : findStyleById(params.styleSelection)?.style.name || params.styleSelection;
-
-        const effectiveCategory = isFreshRefUpload
-          ? 'Auto / Market Trend (AI Choice)'
-          : params.category;
-
-        const effectiveColorStyle = isFreshRefUpload
-          ? 'Random / AI-Curated'
-          : params.colorStyle;
-
-        const activeRef =
-          overrideRef !== undefined ? overrideRef : referenceImage;
-
-        const [blueprint] = await requestAiBlueprints({
-          category: effectiveCategory,
-          styleName: resolvedStyleName,
-          prompt: params.prompt,
-          colorStyle: effectiveColorStyle,
-          complexity: params.complexity,
-          aspectLabel: targetDims.aspectLabel,
-          count: 1,
-          recentConcepts: recentConceptsRef.current,
-          referenceImage: activeRef || undefined,
-          previousBlueprint: isRefineMode ? params.aiBlueprint : undefined,
-          refineInstruction: isRefineMode
-            ? refineInstruction.trim() ||
-              params.prompt.trim() ||
-              'Enhance geometric intricacy, studio lighting contrast, and depth cleanly'
-            : undefined,
-          apiKey: geminiApiKey,
-          signal: controller.signal,
-        });
-
-        if (!controller.signal.aborted && blueprint) {
-          setParams((prev) => {
-            const nextBase = isFreshRefUpload
-              ? {
-                  ...prev,
-                  category: 'Auto / Market Trend (AI Choice)',
-                  styleSelection: 'ai-invention',
-                  colorStyle: 'Random / AI-Curated' as const,
-                  useCustomBaseColor: false,
-                  useAiDirector: true,
-                }
-              : {
-                  ...prev,
-                  useAiDirector: true,
-                };
-            return applyBlueprintToParams(nextBase, blueprint);
-          });
-          if (isRefineMode) {
-            setRefineInstruction('');
-          }
-        }
-      } catch (err: any) {
-        if (err?.name !== 'AbortError') {
-          setErrorMsg(err?.message || 'Gemini AI Creative Director failed.');
-        }
-      } finally {
-        if (!controller.signal.aborted) {
-          setIsThinking(false);
-          setIsRefining(false);
-        }
-      }
-    },
-    [
-      applyBlueprintToParams,
-      geminiApiKey,
-      isRefining,
-      isThinking,
-      params.aiBlueprint,
-      params.category,
-      params.colorStyle,
-      params.complexity,
-      params.prompt,
-      params.styleSelection,
-      params.useAiDirector,
-      referenceImage,
-      refineInstruction,
-      targetDims.aspectLabel,
-    ]
-  );
-
-  const handleThinkAndGenerate = useCallback(() => {
-    runAiThink(undefined, false);
-  }, [runAiThink]);
-
-  const handleRefineWithAi = useCallback(() => {
-    if (!params.aiBlueprint) return;
-    runAiThink(undefined, true);
-  }, [params.aiBlueprint, runAiThink]);
-
-  const handleReferenceFile = useCallback(
-    async (file: File | null | undefined) => {
-      if (!file || !file.type.startsWith('image/')) return;
-      setErrorMsg(null);
-      try {
-        const payload = await fileToReferencePayload(file);
-        setReferenceImage(payload);
-        runAiThink(payload, false);
-      } catch (err: any) {
-        setErrorMsg(err?.message || 'Could not load reference image.');
-      }
-    },
-    [runAiThink]
-  );
-
-  const handleApplyManualCode = useCallback(() => {
-    if (!params.aiBlueprint) return;
+  const handleRegenerateProcedural = useCallback(() => {
     setErrorMsg(null);
-    setParams((prev) => {
-      if (!prev.aiBlueprint) return prev;
-      return {
-        ...prev,
-        aiBlueprint: {
-          ...prev.aiBlueprint,
-          glslCode: editableGlsl,
-          canvasCode: editableCanvas,
-        },
-      };
-    });
-  }, [editableCanvas, editableGlsl, params.aiBlueprint]);
+    setParams((prev) => ({
+      ...prev,
+      seed: prev.seedLocked ? prev.seed : generateRandomSeed(),
+      useAiDirector: false,
+      aiBlueprint: undefined,
+    }));
+  }, []);
 
   const handleSwatchChange = useCallback(
     (slot: 'base' | 'primary' | 'secondary' | 'accent' | 'highlight', hex: string) => {
@@ -659,7 +441,6 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
       } else {
         const res = await renderBackgroundToCanvas(params, {
           previewMaxEdge: 960,
-          apiKey: geminiApiKey,
         });
         thumbCanvas = res.canvas;
         width = res.width;
@@ -701,7 +482,6 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
       setIsSavingToGallery(false);
     }
   }, [
-    geminiApiKey,
     isSavingToGallery,
     params,
     stageMeta.conceptTitle,
@@ -715,7 +495,7 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
     targetDims.width,
   ]);
 
-  // Queue-based Batch Generation (with Gemini Creative Director chunks when AI Director is enabled)
+  // Queue-based Procedural Batch Generation
   const handleRunBatch = useCallback(
     async (count: number) => {
       const qty = clampNum(Math.round(count), 1, 200);
@@ -730,9 +510,7 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
         active: true,
         total: qty,
         completed: 0,
-        label: params.useAiDirector
-          ? 'Consulting Gemini Creative Director...'
-          : 'Starting procedural batch...',
+        label: 'Starting procedural batch...',
       });
 
       try {
@@ -740,68 +518,34 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
 
         while (generatedSoFar < qty) {
           if (controller.signal.aborted) break;
-          const chunkCount = params.useAiDirector
-            ? Math.min(3, qty - generatedSoFar)
-            : Math.min(8, qty - generatedSoFar);
-          let chunkBlueprints: AiBlueprint[] = [];
-
-          if (params.useAiDirector) {
-            const resolvedStyleName =
-              params.styleSelection === 'ai-invention'
-                ? 'ai-invention'
-                : findStyleById(params.styleSelection)?.style.name || params.styleSelection;
-
-            setBatchProgress({
-              active: true,
-              total: qty,
-              completed: generatedSoFar,
-              label: `AI inventing & coding concepts ${generatedSoFar + 1}–${generatedSoFar + chunkCount} of ${qty}...`,
-            });
-
-            chunkBlueprints = await requestAiBlueprints({
-              category: params.category,
-              styleName: resolvedStyleName,
-              prompt: params.prompt,
-              colorStyle: params.colorStyle,
-              complexity: params.complexity,
-              aspectLabel: targetDims.aspectLabel,
-              count: chunkCount,
-              recentConcepts: recentConceptsRef.current,
-              referenceImage: referenceImage || undefined,
-              apiKey: geminiApiKey,
-              signal: controller.signal,
-            });
-          }
+          const chunkCount = Math.min(8, qty - generatedSoFar);
 
           for (let i = 0; i < chunkCount; i++) {
             if (controller.signal.aborted) break;
-            const bp = chunkBlueprints[i];
-            const itemParams: TechBgParams = bp
-              ? applyBlueprintToParams(params, bp)
-              : {
-                  ...params,
-                  seed: params.seedLocked ? params.seed : generateRandomSeed(),
-                  density: clampNum(params.density + Math.round((Math.random() - 0.5) * 20), 15, 95),
-                  scale: clampNum(params.scale + Math.round((Math.random() - 0.5) * 24), 55, 160),
-                  rotation: (params.rotation + Math.round(Math.random() * 120)) % 360,
-                  glowIntensity: clampNum(
-                    params.glowIntensity + Math.round((Math.random() - 0.5) * 18),
-                    10,
-                    95
-                  ),
-                  aiBlueprint: undefined,
-                };
+            const itemParams: TechBgParams = {
+              ...params,
+              seed: params.seedLocked ? params.seed : generateRandomSeed(),
+              density: clampNum(params.density + Math.round((Math.random() - 0.5) * 20), 15, 95),
+              scale: clampNum(params.scale + Math.round((Math.random() - 0.5) * 24), 55, 160),
+              rotation: (params.rotation + Math.round(Math.random() * 120)) % 360,
+              glowIntensity: clampNum(
+                params.glowIntensity + Math.round((Math.random() - 0.5) * 18),
+                10,
+                95
+              ),
+              useAiDirector: false,
+              aiBlueprint: undefined,
+            };
 
             setBatchProgress({
               active: true,
               total: qty,
               completed: generatedSoFar,
-              label: `Rendering ${generatedSoFar + 1}/${qty}: ${bp?.conceptTitle || itemParams.seed}`,
+              label: `Rendering ${generatedSoFar + 1}/${qty}: ${itemParams.seed}`,
             });
 
             const res = await renderBackgroundToCanvas(itemParams, {
               previewMaxEdge: 880,
-              apiKey: geminiApiKey,
               signal: controller.signal,
             });
             if (controller.signal.aborted) break;
@@ -844,14 +588,7 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
         setBatchProgress(null);
       }
     },
-    [
-      applyBlueprintToParams,
-      batchProgress?.active,
-      geminiApiKey,
-      params,
-      referenceImage,
-      targetDims.aspectLabel,
-    ]
+    [batchProgress?.active, params]
   );
 
   // Full-resolution direct export (renders directly at target 4K/8K/Custom pixel size)
@@ -874,7 +611,6 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
 
       try {
         const res = await renderBackgroundToCanvas(itemParams, {
-          apiKey: geminiApiKey,
           signal: controller.signal,
         });
         if (controller.signal.aborted) return;
@@ -899,7 +635,7 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
         setExportProgress(null);
       }
     },
-    [exportProgress?.active, exportSettings, geminiApiKey]
+    [exportProgress?.active, exportSettings]
   );
 
   // Batch ZIP export at true target pixel resolution
@@ -934,7 +670,6 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
         });
 
         const res = await renderBackgroundToCanvas(item.params, {
-          apiKey: geminiApiKey,
           signal: controller.signal,
         });
         if (controller.signal.aborted) break;
@@ -967,102 +702,71 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
     } finally {
       setExportProgress(null);
     }
-  }, [exportProgress?.active, exportSettings, gallery, geminiApiKey, selectedIds]);
+  }, [exportProgress?.active, exportSettings, gallery, selectedIds]);
 
-  const handleRegenerateGalleryItem = useCallback(
-    async (id: string) => {
-      const existing = galleryRef.current.find((g) => g.id === id);
-      if (!existing) return;
-      setErrorMsg(null);
+  const handleRegenerateGalleryItem = useCallback(async (id: string) => {
+    const existing = galleryRef.current.find((g) => g.id === id);
+    if (!existing) return;
+    setErrorMsg(null);
 
-      try {
-        let nextParams: TechBgParams = {
-          ...existing.params,
-          seed: existing.params.seedLocked ? existing.params.seed : generateRandomSeed(),
-        };
+    try {
+      const nextParams: TechBgParams = {
+        ...existing.params,
+        seed: existing.params.seedLocked ? existing.params.seed : generateRandomSeed(),
+        useAiDirector: false,
+        aiBlueprint: undefined,
+      };
 
-        if (existing.params.useAiDirector) {
-          const dims = resolveTargetDimensions(existing.params);
-          const resolvedStyleName =
-            existing.params.styleSelection === 'ai-invention'
-              ? 'ai-invention'
-              : findStyleById(existing.params.styleSelection)?.style.name ||
-                existing.params.styleSelection;
+      const res = await renderBackgroundToCanvas(nextParams, {
+        previewMaxEdge: 880,
+      });
+      const isAlpha = nextParams.transparentBackground && res.supportsTransparency;
+      const blob = await canvasToBlobAsync(res.canvas, isAlpha ? 'png' : 'jpeg', 86);
+      const nextUrl = URL.createObjectURL(blob);
 
-          const [bp] = await requestAiBlueprints({
-            category: existing.params.category,
-            styleName: resolvedStyleName,
-            prompt: existing.params.prompt,
-            colorStyle: existing.params.colorStyle,
-            complexity: existing.params.complexity,
-            aspectLabel: dims.aspectLabel,
-            count: 1,
-            recentConcepts: recentConceptsRef.current,
-            referenceImage: referenceImage || undefined,
-            apiKey: geminiApiKey,
-          });
-          if (bp) {
-            nextParams = applyBlueprintToParams(existing.params, bp);
-          }
-        }
+      setGallery((prev) =>
+        prev.map((item) => {
+          if (item.id !== id) return item;
+          if (item.previewUrl.startsWith('blob:')) URL.revokeObjectURL(item.previewUrl);
+          return {
+            ...item,
+            previewUrl: nextUrl,
+            params: cloneTechBgParams(nextParams),
+            resolvedCategory: res.resolvedCategory,
+            styleName: res.styleName,
+            conceptTitle: res.conceptTitle,
+            marketDemandInsight: res.marketDemandInsight,
+            creativeRationale: res.creativeRationale,
+            qualityReport: undefined,
+          };
+        })
+      );
+    } catch (err: any) {
+      setErrorMsg(err?.message || 'Unable to regenerate background.');
+    }
+  }, []);
 
-        const res = await renderBackgroundToCanvas(nextParams, {
-          previewMaxEdge: 880,
-          apiKey: geminiApiKey,
-        });
-        const isAlpha = nextParams.transparentBackground && res.supportsTransparency;
-        const blob = await canvasToBlobAsync(res.canvas, isAlpha ? 'png' : 'jpeg', 86);
-        const nextUrl = URL.createObjectURL(blob);
-
-        setGallery((prev) =>
-          prev.map((item) => {
-            if (item.id !== id) return item;
-            if (item.previewUrl.startsWith('blob:')) URL.revokeObjectURL(item.previewUrl);
-            return {
-              ...item,
-              previewUrl: nextUrl,
-              params: cloneTechBgParams(nextParams),
-              resolvedCategory: res.resolvedCategory,
-              styleName: res.styleName,
-              conceptTitle: res.conceptTitle,
-              marketDemandInsight: res.marketDemandInsight,
-              creativeRationale: res.creativeRationale,
-              qualityReport: undefined,
-            };
-          })
-        );
-      } catch (err: any) {
-        setErrorMsg(err?.message || 'Unable to regenerate background.');
-      }
-    },
-    [applyBlueprintToParams, geminiApiKey, referenceImage]
-  );
-
-  const handleRunItemQualityCheck = useCallback(
-    async (item: GeneratedBackground) => {
-      try {
-        const res = await renderBackgroundToCanvas(item.params, {
-          previewMaxEdge: 960,
-          apiKey: geminiApiKey,
-        });
-        const report = analyzeStockQuality(
-          res.canvas,
-          item.width,
-          item.height,
-          item.params.transparentBackground && res.supportsTransparency
-        );
-        setGallery((prev) =>
-          prev.map((g) => (g.id === item.id ? { ...g, qualityReport: report } : g))
-        );
-        setLightboxItem((prev) =>
-          prev && prev.id === item.id ? { ...prev, qualityReport: report } : prev
-        );
-      } catch {
-        // ignore transient error
-      }
-    },
-    [geminiApiKey]
-  );
+  const handleRunItemQualityCheck = useCallback(async (item: GeneratedBackground) => {
+    try {
+      const res = await renderBackgroundToCanvas(item.params, {
+        previewMaxEdge: 960,
+      });
+      const report = analyzeStockQuality(
+        res.canvas,
+        item.width,
+        item.height,
+        item.params.transparentBackground && res.supportsTransparency
+      );
+      setGallery((prev) =>
+        prev.map((g) => (g.id === item.id ? { ...g, qualityReport: report } : g))
+      );
+      setLightboxItem((prev) =>
+        prev && prev.id === item.id ? { ...prev, qualityReport: report } : prev
+      );
+    } catch {
+      // ignore transient error
+    }
+  }, []);
 
   const handleDeleteGalleryItem = useCallback((id: string) => {
     setGallery((prev) => {
@@ -1128,7 +832,7 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
             BG Studio
           </h2>
           <p className="text-xs text-slate-500 truncate">
-            AI-directed procedural generator for commercial 4K &amp; 8K backgrounds.
+            Procedural generator for commercial 4K &amp; 8K backgrounds.
           </p>
         </div>
 
@@ -1141,22 +845,11 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
             Randomize
           </button>
           <button
-            disabled={isThinking || isRefining}
-            onClick={handleThinkAndGenerate}
-            className="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-semibold transition-colors flex items-center gap-1.5 cursor-pointer whitespace-nowrap disabled:opacity-60"
+            onClick={handleRegenerateProcedural}
+            className="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-semibold transition-colors flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
           >
-            {isThinking ? (
-              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-            ) : params.useAiDirector ? (
-              <Brain className="w-3.5 h-3.5" />
-            ) : (
-              <RefreshCw className={cn('w-3.5 h-3.5', isRenderingStage && 'animate-spin')} />
-            )}
-            {isThinking
-              ? 'AI Coding...'
-              : params.useAiDirector
-                ? 'AI Think & Generate'
-                : 'Regenerate'}
+            <RefreshCw className={cn('w-3.5 h-3.5', isRenderingStage && 'animate-spin')} />
+            Regenerate
           </button>
           <button
             disabled={isSavingToGallery}
@@ -1226,7 +919,7 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
               onChange={(e) => updateParam('styleSelection', e.target.value)}
               className="w-full px-2 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-[11px] font-medium text-slate-800 focus:outline-none focus:border-indigo-500"
             >
-              <option value="ai-invention">AI Free Invention (Unique)</option>
+              <option value="ai-invention">Procedural Auto (Unique)</option>
               {params.category.startsWith('Auto')
                 ? BG_TAXONOMY.map((cat) => (
                     <optgroup key={cat.id} label={cat.name}>
@@ -1420,100 +1113,9 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
           </div>
         )}
 
-        {/* Row 2: Prompt, Reference Image Inspiration, AI/Alpha/Base Toggles, Seed Box & Batch/Export Dropdown */}
-        <div
-          className="flex flex-col xl:flex-row xl:items-center gap-2 pt-2 border-t border-slate-100"
-          onDragOver={(e) => e.preventDefault()}
-          onDrop={(e) => {
-            e.preventDefault();
-            const f = e.dataTransfer?.files?.[0];
-            if (f) handleReferenceFile(f);
-          }}
-        >
-          <div className="flex-1 min-w-0 flex items-center gap-1.5">
-            <input
-              type="text"
-              value={params.prompt}
-              onChange={(e) => updateParam('prompt', e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !isThinking && !isRefining) {
-                  handleThinkAndGenerate();
-                }
-              }}
-              onPaste={(e) => {
-                const items = e.clipboardData?.items;
-                if (!items) return;
-                for (let i = 0; i < items.length; i++) {
-                  if (items[i].type.startsWith('image/')) {
-                    const file = items[i].getAsFile();
-                    if (file) {
-                      e.preventDefault();
-                      handleReferenceFile(file);
-                      break;
-                    }
-                  }
-                }
-              }}
-              placeholder="Prompt or drop/paste ref image — e.g. dark brushed titanium prism rings, aurora mesh..."
-              className="flex-1 min-w-0 px-2.5 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-800 placeholder:text-slate-400 focus:outline-none focus:border-indigo-500"
-            />
-
-            <input
-              ref={refImageInputRef}
-              type="file"
-              accept="image/*"
-              className="hidden"
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                handleReferenceFile(file);
-                e.target.value = '';
-              }}
-            />
-
-            {referenceImage ? (
-              <div className="flex items-center gap-1.5 px-1.5 py-1 bg-indigo-50 border border-indigo-200 rounded-lg shrink-0">
-                {referenceImage.previewUrl && (
-                  <img
-                    src={referenceImage.previewUrl}
-                    alt="Reference"
-                    className="w-6 h-6 rounded object-cover border border-indigo-200"
-                  />
-                )}
-                <span className="text-[11px] font-semibold text-indigo-800 whitespace-nowrap">
-                  Ref Active
-                </span>
-                <button
-                  type="button"
-                  onClick={() => setReferenceImage(null)}
-                  title="Remove reference image"
-                  className="text-indigo-500 hover:text-indigo-800 cursor-pointer"
-                >
-                  <X className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            ) : (
-              <button
-                type="button"
-                onClick={() => refImageInputRef.current?.click()}
-                title="Upload reference image — AI inspects its style DNA & writes original procedural code"
-                className="px-2.5 py-1.5 bg-slate-50 hover:bg-indigo-50 hover:text-indigo-700 hover:border-indigo-200 border border-slate-200 rounded-lg text-[11px] font-semibold text-slate-700 flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0"
-              >
-                <ImagePlus className="w-3.5 h-3.5 text-indigo-600" />
-                Ref Image
-              </button>
-            )}
-          </div>
-
+        {/* Row 2: Alpha/Base Toggles, Seed Box & Batch/Export Dropdown */}
+        <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-100">
           <div className="flex flex-wrap items-center gap-x-3.5 gap-y-1.5 shrink-0">
-            <label className="flex items-center gap-1.5 text-[11px] font-medium text-slate-700 cursor-pointer whitespace-nowrap">
-              <input
-                type="checkbox"
-                checked={params.useAiDirector}
-                onChange={(e) => updateParam('useAiDirector', e.target.checked)}
-                className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-              />
-              AI Director
-            </label>
 
             <label
               className="flex items-center gap-1.5 text-[11px] font-medium text-slate-700 cursor-pointer whitespace-nowrap"
@@ -1736,21 +1338,6 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
             </button>
 
             <div className="flex items-center gap-2">
-              {params.aiBlueprint && (
-                <button
-                  type="button"
-                  onClick={() => setShowCodeDrawer((v) => !v)}
-                  className={cn(
-                    'px-2 py-0.5 border rounded-md text-[10px] font-semibold flex items-center gap-1 transition-colors cursor-pointer whitespace-nowrap',
-                    showCodeDrawer
-                      ? 'bg-indigo-600 text-white border-indigo-600'
-                      : 'bg-slate-50 hover:bg-slate-100 border-slate-200 text-slate-600 hover:text-slate-900'
-                  )}
-                >
-                  <Code2 className="w-2.5 h-2.5" />
-                  {showCodeDrawer ? 'Hide AI Code' : 'View / Edit Code'}
-                </button>
-              )}
               <button
                 type="button"
                 onClick={handleResetDefaults}
@@ -1951,7 +1538,7 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
                     }
                     className="text-[10px] font-semibold text-indigo-600 hover:text-indigo-800 cursor-pointer"
                   >
-                    Restore AI Colors
+                    Restore Auto Colors
                   </button>
                 )}
               </div>
@@ -2038,21 +1625,6 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
               </div>
 
               <div className="flex flex-wrap items-center gap-1.5">
-                {params.aiBlueprint && (
-                  <button
-                    type="button"
-                    onClick={() => setShowCodeDrawer((v) => !v)}
-                    className={cn(
-                      'px-2.5 py-1 border rounded-lg text-[11px] font-semibold flex items-center gap-1.5 cursor-pointer whitespace-nowrap',
-                      showCodeDrawer
-                        ? 'bg-indigo-600 text-white border-indigo-600'
-                        : 'bg-slate-50 hover:bg-slate-100 border-slate-200 text-slate-700'
-                    )}
-                  >
-                    <Code2 className="w-3.5 h-3.5" />
-                    Code &amp; Refine
-                  </button>
-                )}
                 <button
                   onClick={handleRunStageQualityCheck}
                   className="px-2.5 py-1 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-lg text-[11px] font-semibold text-slate-700 flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
@@ -2125,130 +1697,6 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
                 )}
               </div>
             </div>
-
-            {/* Quick AI Refine Bar whenever an AI blueprint is loaded */}
-            {params.aiBlueprint && (
-              <div className="px-3.5 py-2 bg-slate-50 border-t border-slate-100 flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
-                <div className="flex-1 min-w-0 flex items-center gap-2">
-                  <Sparkles className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
-                  <input
-                    type="text"
-                    value={refineInstruction}
-                    onChange={(e) => setRefineInstruction(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && !isThinking && !isRefining) {
-                        handleRefineWithAi();
-                      }
-                    }}
-                    placeholder="Refine active AI code (e.g. add golden rim highlights, thinner wireframe lines, deeper spiral warp...)"
-                    className="w-full px-2.5 py-1 bg-white border border-slate-200 rounded-lg text-[11px] text-slate-800 placeholder:text-slate-400 focus:outline-none focus:border-indigo-500"
-                  />
-                </div>
-                <button
-                  type="button"
-                  disabled={isThinking || isRefining}
-                  onClick={handleRefineWithAi}
-                  className="px-3 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-[11px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60 whitespace-nowrap shrink-0"
-                >
-                  <RefreshCw className={cn('w-3 h-3', isRefining && 'animate-spin')} />
-                  {isRefining ? 'Refining Code...' : 'AI Refine Code'}
-                </button>
-              </div>
-            )}
-
-            {(stageMeta.marketDemandInsight || stageMeta.creativeRationale) && (
-              <div className="px-3.5 py-2 bg-indigo-50/40 border-t border-slate-100 space-y-1 text-[11px] text-slate-700">
-                {stageMeta.marketDemandInsight && (
-                  <div className="flex items-center gap-2 min-w-0">
-                    <Brain className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-                    <span className="truncate" title={stageMeta.marketDemandInsight}>
-                      <strong className="font-semibold text-slate-900">Market Demand:</strong>{' '}
-                      {stageMeta.marketDemandInsight}
-                    </span>
-                  </div>
-                )}
-                {stageMeta.creativeRationale && (
-                  <div className="flex items-center gap-2 min-w-0">
-                    <Brain className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
-                    <span className="truncate" title={stageMeta.creativeRationale}>
-                      <strong className="font-semibold text-indigo-950">AI Direction:</strong>{' '}
-                      {stageMeta.creativeRationale}
-                    </span>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {showCodeDrawer && params.aiBlueprint && (
-              <div className="border-t border-slate-200 bg-slate-950 text-slate-100 p-4 space-y-3">
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-2 text-xs font-semibold">
-                    <Code2 className="w-4 h-4 text-indigo-400" />
-                    <span>
-                      Procedural Source Code ({params.aiBlueprint.renderMode.toUpperCase()})
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={handleApplyManualCode}
-                      className="px-3 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-[11px] font-semibold cursor-pointer"
-                    >
-                      Run Edited Code
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setShowCodeDrawer(false)}
-                      className="text-slate-400 hover:text-white cursor-pointer"
-                    >
-                      <X className="w-4 h-4" />
-                    </button>
-                  </div>
-                </div>
-
-                {params.aiBlueprint.visualAnalysis && (
-                  <div className="px-3 py-2 bg-slate-900/90 border border-slate-800 rounded-xl text-[11px] text-slate-300 leading-relaxed">
-                    <span className="font-semibold text-indigo-300 mr-1.5">AI Architectural Analysis:</span>
-                    {params.aiBlueprint.visualAnalysis}
-                  </div>
-                )}
-
-                <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-                  {(params.aiBlueprint.renderMode === 'glsl' ||
-                    params.aiBlueprint.renderMode === 'hybrid' ||
-                    Boolean(editableGlsl)) && (
-                    <div className="space-y-1">
-                      <label className="text-[10px] font-mono uppercase tracking-wider text-slate-400 block">
-                        GLSL ES 3.00 Fragment (renderBackground)
-                      </label>
-                      <textarea
-                        value={editableGlsl}
-                        onChange={(e) => setEditableGlsl(e.target.value)}
-                        rows={10}
-                        spellCheck={false}
-                        className="w-full p-2.5 bg-slate-900 border border-slate-800 rounded-xl text-[11px] font-mono text-emerald-300 focus:outline-none focus:border-indigo-500"
-                      />
-                    </div>
-                  )}
-                  {(params.aiBlueprint.renderMode === 'canvas' ||
-                    params.aiBlueprint.renderMode === 'hybrid' ||
-                    Boolean(editableCanvas)) && (
-                    <div className="space-y-1">
-                      <label className="text-[10px] font-mono uppercase tracking-wider text-slate-400 block">
-                        Canvas 2D Script (ctx, w, h, api)
-                      </label>
-                      <textarea
-                        value={editableCanvas}
-                        onChange={(e) => setEditableCanvas(e.target.value)}
-                        rows={10}
-                        spellCheck={false}
-                        className="w-full p-2.5 bg-slate-900 border border-slate-800 rounded-xl text-[11px] font-mono text-sky-300 focus:outline-none focus:border-indigo-500"
-                      />
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
 
             {showQualityDrawer && stageQualityReport && (
               <div className="border-t border-slate-200 bg-slate-50/70 p-4 space-y-3">
@@ -2376,7 +1824,7 @@ export default function BgStudio({ geminiApiKey }: BgStudioProps) {
                     : 'No favorites marked yet'}
                 </p>
                 <p className="text-xs text-slate-400 max-w-md mx-auto">
-                  Use AI Think &amp; Generate to craft a new composition, click Add to Gallery, or run a Batch Queue (+5, +10, +20, +50).
+                  Click Regenerate or Randomize to craft a new composition, click Add to Gallery, or run a Batch Queue (+5, +10, +20, +50).
                 </p>
               </div>
             ) : (
